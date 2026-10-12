@@ -12,11 +12,16 @@
 
 namespace ledgerkv {
 
-// Write-ahead log records, framed by log.h. Payload layout:
+// Write-ahead log records, framed by log.h. Two payload layouts:
 //
-//   type (1) | seq (8) | varint klen | key | [varint vlen | value]
+//   single op:  type (1, put or delete) | seq (8) | varint klen | key | [varint vlen | value]
+//   batch:      3 (1) | first seq (8) | WriteBatch contents
 //
-// The value is present only for puts.
+// A batch's operations take consecutive sequence numbers starting at the
+// first. Because a batch is one framed record, a crash leaves all of it or
+// none of it.
+
+constexpr uint8_t kWalBatch = 3;
 
 struct WalRecord {
   RecordType type;
@@ -27,7 +32,10 @@ struct WalRecord {
 
 void EncodeWalPayload(RecordType type, uint64_t seq, std::string_view key, std::string_view value,
                       std::string* dst);
-bool DecodeWalPayload(std::string_view payload, WalRecord* record);
+// Appends the payload of a batch whose first operation gets sequence seq.
+void EncodeWalBatchPayload(uint64_t seq, std::string_view batch_contents, std::string* dst);
+// Decodes either layout, appending one record per operation.
+bool DecodeWalPayload(std::string_view payload, std::vector<WalRecord>* records);
 
 // Serializes a record, including its log framing, onto the end of *dst.
 void EncodeWalRecord(const WalRecord& record, std::string* dst);
@@ -38,6 +46,8 @@ class WalWriter {
 
   Status Append(RecordType type, uint64_t seq, std::string_view key, std::string_view value);
   Status Append(const WalRecord& r) { return Append(r.type, r.seq, r.key, r.value); }
+  // Appends pre-framed records in one write and at most one sync.
+  Status AppendFramed(std::string_view framed) { return log_->AddFramedRecords(framed); }
 
  private:
   explicit WalWriter(std::unique_ptr<LogWriter> log) : log_(std::move(log)) {}

@@ -26,15 +26,17 @@ Status TableBuilder::Open() {
 }
 
 void TableBuilder::Add(std::string_view key, uint64_t seq, RecordType type, std::string_view value) {
-  assert(num_entries_ == 0 || key > std::string_view(last_key_));
+  assert(num_entries_ == 0 || CompareInternal(key, seq, last_key_, last_seq_) > 0);
   if (!status_.ok()) return;
   if (num_entries_ == 0) smallest_.assign(key);
 
   PutLengthPrefixed(&data_block_, key);
   PutFixed64(&data_block_, PackTag(seq, type));
   PutLengthPrefixed(&data_block_, value);
-  bloom_.AddKey(key);
+  // Versions of a key are adjacent, so this adds each user key once.
+  if (num_entries_ == 0 || key != std::string_view(last_key_)) bloom_.AddKey(key);
   last_key_.assign(key);
+  last_seq_ = seq;
   num_entries_++;
 
   if (data_block_.size() >= options_.block_size) status_ = FlushDataBlock();
@@ -58,6 +60,7 @@ Status TableBuilder::FlushDataBlock() {
   Status s = WriteBlock(data_block_, &offset, &size);
   if (!s.ok()) return s;
   PutLengthPrefixed(&index_block_, last_key_);
+  PutFixed64(&index_block_, PackTag(last_seq_, RecordType::kPut));
   PutVarint64(&index_block_, offset);
   PutVarint64(&index_block_, size);
   data_block_.clear();

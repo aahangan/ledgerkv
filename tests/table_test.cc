@@ -79,19 +79,19 @@ TEST(TableGetAndForEach) {
     int k = 2 * i;
     std::string v;
     LookupResult r;
-    CHECK_OK(t->Get(Key(k), &v, &r));
+    CHECK_OK(t->Get(Key(k), kMaxSequence, &v, &r));
     if (i % 10 == 0) {
       CHECK(r == LookupResult::kDeleted);
     } else {
       CHECK(r == LookupResult::kFound);
       CHECK_EQ(v, Value(k));
     }
-    CHECK_OK(t->Get(Key(k + 1), &v, &r));  // Odd keys were never added.
+    CHECK_OK(t->Get(Key(k + 1), kMaxSequence, &v, &r));  // Odd keys were never added.
     CHECK(r == LookupResult::kMissing);
   }
   std::string v;
   LookupResult r;
-  CHECK_OK(t->Get("zzz", &v, &r));  // Past the last key.
+  CHECK_OK(t->Get("zzz", kMaxSequence, &v, &r));  // Past the last key.
   CHECK(r == LookupResult::kMissing);
 
   int count = 0;
@@ -135,7 +135,7 @@ TEST(TableDetectsCorruption) {
       if (i % 10 == 0) continue;
       std::string v;
       LookupResult r;
-      Status gs = t->Get(Key(2 * i), &v, &r);
+      Status gs = t->Get(Key(2 * i), kMaxSequence, &v, &r);
       if (!gs.ok()) {
         CHECK(gs.IsCorruption());
         saw_error = true;

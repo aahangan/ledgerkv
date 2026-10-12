@@ -1,5 +1,6 @@
 #include <unistd.h>
 
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 
@@ -17,6 +18,7 @@ std::string TempDir() {
 }  // namespace ledgerkv::testing
 
 int main(int argc, char** argv) {
+  std::setvbuf(stdout, nullptr, _IOLBF, 0);  // Show progress even when output is piped.
   const char* filter = argc > 1 ? argv[1] : nullptr;
   int ran = 0;
   for (const auto& t : ledgerkv::testing::Registry()) {

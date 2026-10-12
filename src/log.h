@@ -38,6 +38,11 @@ class LogWriter {
   // returns OK.
   Status AddRecord(std::string_view payload);
 
+  // Appends bytes that already hold one or more framed records (built with
+  // AppendLogRecord) in a single write, followed by at most one sync. This is
+  // how group commit makes many writers durable with one fsync.
+  Status AddFramedRecords(std::string_view framed);
+
  private:
   LogWriter(std::string path, int fd, bool sync) : path_(std::move(path)), fd_(fd), sync_(sync) {}
 

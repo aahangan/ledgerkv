@@ -22,3 +22,5 @@ jobs:
         run: ./build/ledgerkv_tests
       - name: Crash test
         run: ./build/crash_test --iterations 100
+      - name: Crash test, 8 concurrent writers
+        run: ./build/crash_test --iterations 50 --threads 8

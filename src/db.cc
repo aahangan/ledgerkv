@@ -12,23 +12,27 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <deque>
 #include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
-#include <queue>
 #include <set>
 #include <thread>
 #include <vector>
 
+#include "db_iter.h"
 #include "file_util.h"
 #include "filename.h"
 #include "log.h"
 #include "memtable.h"
+#include "merger.h"
 #include "table.h"
 #include "table_builder.h"
+#include "version.h"
 #include "version_edit.h"
 #include "wal.h"
+#include "write_batch_internal.h"
 
 namespace ledgerkv {
 namespace {
@@ -43,64 +47,60 @@ constexpr uint64_t kManifestRotateBytes = 4 << 20;
 // shutdown, in entries.
 constexpr int kCompactionCheckInterval = 4096;
 
+// A commit group carries at most this many bytes of batches. A small leading
+// batch caps the group lower, so one tiny write is not held up behind
+// megabytes of others.
+constexpr size_t kMaxGroupBytes = 1 << 20;
+constexpr size_t kSmallBatchBytes = 128 << 10;
+
 using Clock = std::chrono::steady_clock;
 
 uint64_t MicrosSince(Clock::time_point start) {
   return std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - start).count();
 }
 
-struct FileEntry {
-  TableMeta meta;
-  std::shared_ptr<Table> table;
+class SnapshotImpl final : public Snapshot {
+ public:
+  explicit SnapshotImpl(uint64_t s) : seq(s) {}
+  ~SnapshotImpl() override = default;
+  const uint64_t seq;
 };
 
-// An immutable snapshot of the live tables. Readers grab a shared_ptr to the
-// current Version and search it without holding any lock; flushes and
-// compactions install a new Version rather than modifying the old one. A
-// table deleted by a compaction stays readable through older Versions,
-// because POSIX keeps an unlinked file alive while it is open.
-struct Version {
-  // levels[0] is newest first: flushes run one at a time, so higher file
-  // numbers are newer, and the first level-0 table with an entry for a key
-  // holds its latest value. Levels 1+ are sorted by key and non-overlapping.
-  std::array<std::vector<FileEntry>, kNumLevels> levels;
+uint64_t SnapshotSeq(const Snapshot* s) { return static_cast<const SnapshotImpl*>(s)->seq; }
+
+// Decides which entries of an internal-order stream no reader can ever see.
+// An entry is shadowed when a newer version of the same key is already
+// visible to every snapshot (its sequence is at or below the oldest one): no
+// reader can see past that newer version to this one.
+class ShadowFilter {
+ public:
+  explicit ShadowFilter(uint64_t smallest_snapshot) : smallest_snapshot_(smallest_snapshot) {}
+
+  bool Shadowed(std::string_view key, uint64_t seq) {
+    if (!has_key_ || key != std::string_view(key_)) {
+      key_.assign(key);
+      has_key_ = true;
+      newer_seq_ = std::numeric_limits<uint64_t>::max();
+    }
+    bool shadowed = newer_seq_ <= smallest_snapshot_;
+    newer_seq_ = seq;
+    return shadowed;
+  }
+
+  uint64_t smallest_snapshot() const { return smallest_snapshot_; }
+
+ private:
+  const uint64_t smallest_snapshot_;
+  std::string key_;
+  bool has_key_ = false;
+  uint64_t newer_seq_ = 0;
 };
-
-bool Overlaps(const TableMeta& m, std::string_view lo, std::string_view hi) {
-  return !(std::string_view(m.largest) < lo || std::string_view(m.smallest) > hi);
-}
-
-// Returns a new Version with edit applied to base. tables supplies the open
-// Table for every added file.
-std::shared_ptr<Version> ApplyEdit(const Version& base, const VersionEdit& edit,
-                                   const std::map<uint64_t, std::shared_ptr<Table>>& tables) {
-  auto v = std::make_shared<Version>(base);
-  std::set<uint64_t> deleted(edit.deleted_tables.begin(), edit.deleted_tables.end());
-  for (auto& level : v->levels) {
-    std::erase_if(level, [&](const FileEntry& f) { return deleted.count(f.meta.number) > 0; });
-  }
-  for (const TableMeta& m : edit.added_tables) v->levels[m.level].push_back({m, tables.at(m.number)});
-  std::sort(v->levels[0].begin(), v->levels[0].end(),
-            [](const FileEntry& a, const FileEntry& b) { return a.meta.number > b.meta.number; });
-  for (int level = 1; level < kNumLevels; level++) {
-    std::sort(v->levels[level].begin(), v->levels[level].end(),
-              [](const FileEntry& a, const FileEntry& b) { return a.meta.smallest < b.meta.smallest; });
-  }
-  return v;
-}
-
-std::set<uint64_t> LiveTables(const Version& v) {
-  std::set<uint64_t> live;
-  for (const auto& level : v.levels) {
-    for (const FileEntry& f : level) live.insert(f.meta.number);
-  }
-  return live;
-}
 
 struct Compaction {
-  int level = 0;                  // Inputs come from level and level + 1.
+  int level = 0;                  // Inputs come from level and out_level.
+  int out_level = 1;              // level + 1, or level itself to rewrite the bottom level in place.
   std::vector<FileEntry> inputs;  // From level.
-  std::vector<FileEntry> next;    // From level + 1, overlapping inputs' key range.
+  std::vector<FileEntry> next;    // From out_level, overlapping inputs' key range.
 };
 
 class DBImpl final : public DB {
@@ -111,31 +111,50 @@ class DBImpl final : public DB {
   Status Init();
 
   Status Put(std::string_view key, std::string_view value) override {
-    if (key.size() > kMaxKeySize) return Status::InvalidArgument("key too large");
-    if (value.size() > kMaxValueSize) return Status::InvalidArgument("value too large");
-    return Write(RecordType::kPut, key, value);
+    WriteBatch batch;
+    batch.Put(key, value);
+    return Write(batch);
   }
 
   Status Delete(std::string_view key) override {
-    if (key.size() > kMaxKeySize) return Status::InvalidArgument("key too large");
-    return Write(RecordType::kDelete, key, {});
+    WriteBatch batch;
+    batch.Delete(key);
+    return Write(batch);
   }
 
-  Status Get(std::string_view key, std::string* value) override;
+  Status Write(const WriteBatch& batch) override;
+
+  using DB::Get;
+  Status Get(const ReadOptions& options, std::string_view key, std::string* value) override;
+  std::unique_ptr<Iterator> NewIterator(const ReadOptions& options) override;
+  const Snapshot* GetSnapshot() override;
+  void ReleaseSnapshot(const Snapshot* snapshot) override;
   Status Flush() override;
   Status CompactAll() override;
   Status Verify() override;
   DBStats GetStats() override;
 
  private:
+  // A queued write. The writer at the front of writers_ is the leader: it
+  // commits its own batch and those queued behind it with one WAL append,
+  // then wakes them. A null batch asks for a memtable switch (Flush).
+  struct Writer {
+    const WriteBatch* batch = nullptr;
+    uint64_t user_bytes = 0;  // Key and value bytes in batch, for stats.
+    bool done = false;
+    Status status;
+    std::condition_variable cv;
+  };
+
   Status AcquireLock();
-  Status Write(RecordType type, std::string_view key, std::string_view value);
 
   // Makes sure the memtable has room, freezing it and handing it to the
   // background thread when full (or when force is set and it is non-empty).
-  // Slows or blocks the writer when background work falls behind. Requires
-  // write_mu_.
-  Status MakeRoomForWrite(bool force);
+  // Slows or blocks the writer when background work falls behind. Called by
+  // the write leader with mu_ held via lock; may release it while waiting.
+  Status MakeRoomForWrite(std::unique_lock<std::mutex>& lock, bool force);
+
+  uint64_t SmallestSnapshot();
 
   // --- Background thread only. ---
   void BackgroundLoop();
@@ -156,7 +175,10 @@ class DBImpl final : public DB {
   // score of 1 or more means the level is over its limit.
   std::pair<int, double> CompactionScore(const Version& v) const;
 
-  Status WriteTable(const MemTable& mem, TableMeta* meta);
+  // Writes mem to a new, fsynced level-0 table, dropping versions that no
+  // snapshot at or above smallest_snapshot can see.
+  Status WriteTable(const MemTable& mem, uint64_t smallest_snapshot, TableMeta* meta,
+                    uint64_t* versions_dropped);
 
   // Appends edit to the MANIFEST, or rewrites the MANIFEST as a snapshot of
   // v once it has grown large. Called only from Init() and the background
@@ -190,23 +212,28 @@ class DBImpl final : public DB {
   // compactions rotate through the key space.
   std::array<std::string, kNumLevels> compact_pointer_;
 
-  // Write path, guarded by write_mu_. Writes are serialized so that WAL
-  // order matches sequence number order.
-  std::mutex write_mu_;
-  uint64_t next_seq_ = 1;
+  // Used only by the current write leader, which is unique, so no lock is
+  // needed while it appends and applies a group.
   std::unique_ptr<WalWriter> wal_;
+  std::string group_buffer_;
+
+  // Shared state, guarded by mu_. current_ is only replaced by the
+  // background thread (or Init), so that thread may read it without mu_.
+  // mem_ is only replaced by the write leader, which may likewise use it
+  // without mu_.
+  std::mutex mu_;
+  std::condition_variable bg_cv_;       // Wakes the background thread.
+  std::condition_variable bg_done_cv_;  // Background work finished.
+  std::deque<Writer*> writers_;
+  // Highest sequence number whose write is fully applied. Readers use it as
+  // their implicit snapshot, so a group being applied stays invisible until
+  // the leader publishes it, and batches appear atomically.
+  uint64_t last_sequence_ = 0;
+  std::multiset<uint64_t> snapshots_;
   // Once a WAL append fails, the log may end in a partial record, and
   // anything appended after it would be lost on recovery. All later writes
   // are rejected until the database is reopened.
   Status write_error_;
-
-  // Shared state, guarded by mu_. mem_ is also only replaced while holding
-  // write_mu_, so the write path may read it under write_mu_ alone. current_
-  // is only replaced by the background thread (or Init), so that thread may
-  // read it without mu_.
-  std::mutex mu_;
-  std::condition_variable bg_cv_;       // Wakes the background thread.
-  std::condition_variable bg_done_cv_;  // Background work finished.
   std::shared_ptr<MemTable> mem_ = std::make_shared<MemTable>();
   std::shared_ptr<MemTable> imm_;  // Frozen memtable being flushed, if any.
   uint64_t imm_log_boundary_ = 0;  // First log number not covered by imm_.
@@ -218,7 +245,6 @@ class DBImpl final : public DB {
 
   std::atomic<bool> shutting_down_{false};
   std::atomic<bool> has_imm_{false};
-  std::atomic<uint64_t> user_bytes_written_{0};
   std::thread bg_thread_;
 };
 
@@ -319,15 +345,14 @@ Status DBImpl::Init() {
       if (!s.ok()) return s;
     }
     for (const WalRecord& r : log.records) {
-      if (r.type == RecordType::kPut) {
-        recovered.Put(r.seq, r.key, r.value);
-      } else {
-        recovered.Delete(r.seq, r.key);
-      }
+      // A log can repeat a sequence number only if this database was
+      // corrupted, but skip rather than insert a duplicate key.
+      if (r.seq <= last_seq) continue;
+      recovered.Add(r.seq, r.type, r.key, r.value);
       max_seq = std::max(max_seq, r.seq);
     }
   }
-  next_seq_ = max_seq + 1;
+  last_sequence_ = max_seq;
 
   // 4. Open the live tables, and flush whatever was recovered to a new
   // level-0 table so the old logs can be deleted. This keeps recovery time
@@ -341,7 +366,8 @@ Status DBImpl::Init() {
   }
   if (!recovered.Empty()) {
     TableMeta meta;
-    s = WriteTable(recovered, &meta);
+    uint64_t dropped = 0;
+    s = WriteTable(recovered, max_seq, &meta, &dropped);  // No snapshots exist yet.
     if (s.ok()) s = Table::Open(TableFileName(dir_, meta.number), meta.file_size, &open_tables[meta.number]);
     if (!s.ok()) return s;
     edit.added_tables.push_back(meta);
@@ -364,7 +390,8 @@ Status DBImpl::Init() {
   return Status::OK();
 }
 
-Status DBImpl::WriteTable(const MemTable& mem, TableMeta* meta) {
+Status DBImpl::WriteTable(const MemTable& mem, uint64_t smallest_snapshot, TableMeta* meta,
+                          uint64_t* versions_dropped) {
   meta->level = 0;
   meta->number = next_file_number_++;
   std::string path = TableFileName(dir_, meta->number);
@@ -374,9 +401,15 @@ Status DBImpl::WriteTable(const MemTable& mem, TableMeta* meta) {
   TableBuilder builder(topts, path);
   Status s = builder.Open();
   if (s.ok()) {
-    mem.ForEach([&](std::string_view key, uint64_t seq, RecordType type, std::string_view value) {
-      builder.Add(key, seq, type, value);
-    });
+    ShadowFilter filter(smallest_snapshot);
+    auto it = mem.NewIterator();
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      if (filter.Shadowed(it->key(), it->seq())) {
+        (*versions_dropped)++;
+        continue;
+      }
+      builder.Add(it->key(), it->seq(), it->type(), it->value());
+    }
     s = builder.Finish();
   }
   if (!s.ok()) {
@@ -459,6 +492,11 @@ void DBImpl::InstallVersion(std::shared_ptr<const Version> v) {
   current_ = std::move(v);
 }
 
+uint64_t DBImpl::SmallestSnapshot() {
+  std::lock_guard lock(mu_);
+  return snapshots_.empty() ? last_sequence_ : *snapshots_.begin();
+}
+
 double DBImpl::MaxBytesForLevel(int level) const {
   double bytes = static_cast<double>(options_.max_bytes_for_level_base);
   for (int l = 1; l < level; l++) bytes *= options_.level_size_multiplier;
@@ -487,6 +525,7 @@ std::optional<Compaction> DBImpl::PickCompaction(const Version& v) {
 
   Compaction c;
   c.level = level;
+  c.out_level = level + 1;
   if (level == 0) {
     // Level-0 tables overlap, so take all of them.
     c.inputs = v.levels[0];
@@ -550,8 +589,9 @@ Status DBImpl::FlushImmutable() {
   // deleted. A crash at any point leaves either the old log (replayed on
   // open) or a committed table, never neither.
   TableMeta meta;
+  uint64_t versions_dropped = 0;
   std::map<uint64_t, std::shared_ptr<Table>> tables;
-  Status s = WriteTable(*imm, &meta);
+  Status s = WriteTable(*imm, SmallestSnapshot(), &meta, &versions_dropped);
   if (s.ok()) s = Table::Open(TableFileName(dir_, meta.number), meta.file_size, &tables[meta.number]);
   if (!s.ok()) return s;
 
@@ -567,17 +607,18 @@ Status DBImpl::FlushImmutable() {
   has_imm_ = false;
   stats_.flushes++;
   stats_.flush_bytes_written += meta.file_size;
+  stats_.versions_dropped += versions_dropped;
   bg_done_cv_.notify_all();
   return Status::OK();
 }
 
 Status DBImpl::DoCompaction(const Compaction& c) {
-  const int out_level = c.level + 1;
+  const int out_level = c.out_level;
   VersionEdit edit;
   std::map<uint64_t, std::shared_ptr<Table>> tables;
 
   // A lone table with nothing to merge against moves down without a rewrite.
-  if (c.inputs.size() == 1 && c.next.empty()) {
+  if (c.inputs.size() == 1 && c.next.empty() && out_level > c.level) {
     TableMeta moved = c.inputs[0].meta;
     edit.deleted_tables.push_back(moved.number);
     moved.level = out_level;
@@ -592,29 +633,22 @@ Status DBImpl::DoCompaction(const Compaction& c) {
   }
 
   // Tombstones are tested against the Version as of the start. Concurrent
-  // flushes only add level-0 tables, which never sit below out_level.
+  // flushes only add level-0 tables, which never sit below out_level. Later
+  // snapshots have higher sequence numbers, so the oldest one now bounds
+  // what any reader can see for the whole compaction.
   std::shared_ptr<const Version> base = current_;
+  ShadowFilter filter(SmallestSnapshot());
 
-  // k-way merge of every input, ordered by key, then newest first.
-  std::vector<std::unique_ptr<Table::Iterator>> iters;
+  std::vector<std::unique_ptr<InternalIterator>> children;
   uint64_t bytes_read = 0;
   for (const auto* files : {&c.inputs, &c.next}) {
     for (const FileEntry& f : *files) {
-      iters.push_back(std::make_unique<Table::Iterator>(f.table.get()));
+      children.push_back(std::make_unique<Table::Iterator>(f.table.get()));
       edit.deleted_tables.push_back(f.meta.number);
       bytes_read += f.meta.file_size;
     }
   }
-  auto later = [](const Table::Iterator* a, const Table::Iterator* b) {
-    int cmp = a->key().compare(b->key());
-    return cmp != 0 ? cmp > 0 : a->seq() < b->seq();
-  };
-  std::priority_queue<Table::Iterator*, std::vector<Table::Iterator*>, decltype(later)> heap(later);
-  for (auto& it : iters) {
-    it->SeekToFirst();
-    if (it->Valid()) heap.push(it.get());
-    if (!it->status().ok()) return it->status();
-  }
+  auto input = NewMergingIterator(std::move(children));
 
   TableBuilder::Options topts;
   topts.block_size = options_.block_size;
@@ -622,7 +656,7 @@ Status DBImpl::DoCompaction(const Compaction& c) {
   std::unique_ptr<TableBuilder> builder;
   TableMeta out;
   std::vector<TableMeta> outputs;
-  uint64_t tombstones_dropped = 0;
+  uint64_t tombstones_dropped = 0, versions_dropped = 0;
 
   auto abandon = [&] {
     if (builder) builder->Abandon();
@@ -639,10 +673,8 @@ Status DBImpl::DoCompaction(const Compaction& c) {
     return Status::OK();
   };
 
-  std::string last_key;
-  bool has_last = false;
   int since_check = 0;
-  while (!heap.empty()) {
+  for (input->SeekToFirst(); input->Valid(); input->Next()) {
     if (++since_check >= kCompactionCheckInterval) {
       since_check = 0;
       if (shutting_down_) {
@@ -659,61 +691,54 @@ Status DBImpl::DoCompaction(const Compaction& c) {
       }
     }
 
-    Table::Iterator* it = heap.top();
-    heap.pop();
-    // Only the newest entry for each key survives. Without snapshots
-    // (milestone 4) no reader can see the older ones.
-    bool newest = !has_last || it->key() != std::string_view(last_key);
-    if (newest) {
-      last_key.assign(it->key());
-      has_last = true;
-      if (it->type() == RecordType::kDelete && IsBottommostForKey(*base, out_level, it->key())) {
-        // Nothing older lies below, so the tombstone has nothing left to hide.
-        tombstones_dropped++;
-      } else {
-        if (!builder) {
-          out = TableMeta();
-          out.level = out_level;
-          out.number = next_file_number_++;
-          pending_outputs_.insert(out.number);
-          builder = std::make_unique<TableBuilder>(topts, TableFileName(dir_, out.number));
-          Status s = builder->Open();
-          if (!s.ok()) {
-            abandon();
-            return s;
-          }
-        }
-        builder->Add(it->key(), it->seq(), it->type(), it->value());
-        // Outputs split only between distinct keys, so tables in out_level
-        // never share a key.
-        if (builder->FileSize() >= options_.target_file_size) {
-          Status s = finish_output();
-          if (!s.ok()) {
-            abandon();
-            return s;
-          }
-        }
+    const std::string_view key = input->key();
+    const uint64_t seq = input->seq();
+    if (filter.Shadowed(key, seq)) {
+      versions_dropped++;
+      continue;
+    }
+    if (input->type() == RecordType::kDelete && seq <= filter.smallest_snapshot() &&
+        IsBottommostForKey(*base, out_level, key)) {
+      // Every reader sees this tombstone, and nothing older lies below it,
+      // so it has nothing left to hide. Older versions of the key in this
+      // compaction are shadowed by it and dropped too.
+      tombstones_dropped++;
+      continue;
+    }
+
+    // Outputs split only between distinct user keys, so tables in out_level
+    // never share a key and the level stays non-overlapping.
+    if (builder && builder->FileSize() >= options_.target_file_size && key != builder->LargestKey()) {
+      Status s = finish_output();
+      if (!s.ok()) {
+        abandon();
+        return s;
       }
     }
-    it->Next();
-    if (it->Valid()) {
-      heap.push(it);
-    } else if (!it->status().ok()) {
-      abandon();
-      return it->status();
+    if (!builder) {
+      out = TableMeta();
+      out.level = out_level;
+      out.number = next_file_number_++;
+      pending_outputs_.insert(out.number);
+      builder = std::make_unique<TableBuilder>(topts, TableFileName(dir_, out.number));
+      Status s = builder->Open();
+      if (!s.ok()) {
+        abandon();
+        return s;
+      }
     }
+    builder->Add(key, seq, input->type(), input->value());
   }
-  if (builder) {
-    Status s = finish_output();
-    if (!s.ok()) {
-      abandon();
-      return s;
-    }
+  Status s = input->status();
+  if (s.ok() && builder) s = finish_output();
+  if (!s.ok()) {
+    abandon();
+    return s;
   }
 
   // Same crash ordering as a flush: outputs durable, then the MANIFEST edit
   // swaps inputs for outputs atomically, then inputs are deleted.
-  Status s = SyncDir(dir_);
+  s = SyncDir(dir_);
   uint64_t bytes_written = 0;
   for (const TableMeta& m : outputs) {
     if (s.ok()) s = Table::Open(TableFileName(dir_, m.number), m.file_size, &tables[m.number]);
@@ -730,6 +755,7 @@ Status DBImpl::DoCompaction(const Compaction& c) {
   std::lock_guard lock(mu_);
   stats_.compactions++;
   stats_.tombstones_dropped += tombstones_dropped;
+  stats_.versions_dropped += versions_dropped;
   stats_.compaction_bytes_read += bytes_read;
   stats_.compaction_bytes_written += bytes_written;
   return Status::OK();
@@ -746,6 +772,7 @@ Status DBImpl::RunManualCompaction() {
     if (v->levels[level].empty()) continue;
     Compaction c;
     c.level = level;
+    c.out_level = level + 1;
     c.inputs = v->levels[level];
     std::string lo = c.inputs[0].meta.smallest, hi = c.inputs[0].meta.largest;
     for (const FileEntry& f : c.inputs) {
@@ -758,7 +785,17 @@ Status DBImpl::RunManualCompaction() {
     Status s = DoCompaction(c);
     if (!s.ok()) return s;
   }
-  return Status::OK();
+
+  // Finally rewrite the bottom level in place. Nothing above pushes into it
+  // any more, but it can still hold versions and tombstones that were kept
+  // for snapshots since released.
+  std::shared_ptr<const Version> v = current_;
+  if (shutting_down_ || v->levels[kNumLevels - 1].empty()) return Status::OK();
+  Compaction bottom;
+  bottom.level = kNumLevels - 1;
+  bottom.out_level = kNumLevels - 1;
+  bottom.inputs = v->levels[kNumLevels - 1];
+  return DoCompaction(bottom);
 }
 
 void DBImpl::BackgroundLoop() {
@@ -789,15 +826,14 @@ void DBImpl::BackgroundLoop() {
   }
 }
 
-Status DBImpl::MakeRoomForWrite(bool force) {
+Status DBImpl::MakeRoomForWrite(std::unique_lock<std::mutex>& lock, bool force) {
   bool allow_delay = !force;
-  std::unique_lock lock(mu_);
   while (true) {
     if (!bg_error_.ok()) return bg_error_;
     const size_t l0 = current_->levels[0].size();
     if (allow_delay && l0 >= static_cast<size_t>(options_.level0_slowdown_trigger)) {
       // Level 0 is getting deep. Rather than stopping writes outright later,
-      // spread the delay: give compaction 1 ms of headroom per write.
+      // spread the delay: give compaction 1 ms of headroom per write group.
       lock.unlock();
       auto start = Clock::now();
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -833,47 +869,122 @@ Status DBImpl::MakeRoomForWrite(bool force) {
   }
 }
 
-Status DBImpl::Write(RecordType type, std::string_view key, std::string_view value) {
-  std::lock_guard lock(write_mu_);
-  if (!write_error_.ok()) return write_error_;
-  Status s = MakeRoomForWrite(/*force=*/false);
-  if (!s.ok()) return s;
+Status DBImpl::Write(const WriteBatch& batch) {
+  uint64_t user_bytes = 0;
+  Status invalid;
+  bool well_formed = WriteBatchInternal::Iterate(
+      WriteBatchInternal::Contents(batch), [&](RecordType, std::string_view key, std::string_view value) {
+        if (key.size() > kMaxKeySize) invalid = Status::InvalidArgument("key too large");
+        if (value.size() > kMaxValueSize) invalid = Status::InvalidArgument("value too large");
+        user_bytes += key.size() + value.size();
+      });
+  if (!well_formed) return Status::InvalidArgument("malformed write batch");
+  if (!invalid.ok()) return invalid;
+  if (batch.Count() == 0) return Status::OK();
 
-  uint64_t seq = next_seq_;
-  s = wal_->Append(type, seq, key, value);
-  if (!s.ok()) {
-    write_error_ = s;
-    return s;
+  Writer w;
+  w.batch = &batch;
+  w.user_bytes = user_bytes;
+  std::unique_lock lock(mu_);
+  writers_.push_back(&w);
+  while (!w.done && &w != writers_.front()) w.cv.wait(lock);
+  if (w.done) return w.status;  // A leader committed this write for us.
+
+  // This writer is the leader.
+  Status s = write_error_;
+  if (s.ok()) s = MakeRoomForWrite(lock, /*force=*/false);
+  Writer* last = &w;
+  if (s.ok()) {
+    // Gather the queued batches behind this one into a single WAL append.
+    // Each batch stays its own framed record, so each is atomic on its own.
+    const size_t first_bytes = WriteBatchInternal::Contents(batch).size();
+    const size_t max_bytes = first_bytes <= kSmallBatchBytes ? first_bytes + kSmallBatchBytes : kMaxGroupBytes;
+    std::vector<Writer*> group;
+    size_t group_bytes = 0;
+    for (Writer* candidate : writers_) {
+      if (candidate->batch == nullptr) break;  // A Flush() request; let it lead next.
+      size_t bytes = WriteBatchInternal::Contents(*candidate->batch).size();
+      if (!group.empty() && group_bytes + bytes > max_bytes) break;
+      group.push_back(candidate);
+      group_bytes += bytes;
+    }
+    last = group.back();
+
+    const uint64_t first_seq = last_sequence_ + 1;
+    uint64_t seq = first_seq;
+    group_buffer_.clear();
+    std::string payload;
+    for (Writer* g : group) {
+      payload.clear();
+      EncodeWalBatchPayload(seq, WriteBatchInternal::Contents(*g->batch), &payload);
+      AppendLogRecord(payload, &group_buffer_);
+      seq += g->batch->Count();
+    }
+    MemTable* mem = mem_.get();
+
+    // Only the leader touches the WAL and inserts into the memtable, so the
+    // lock can be dropped for the slow part: the write and fsync. New
+    // writers keep queueing meanwhile and form the next group.
+    lock.unlock();
+    s = wal_->AppendFramed(group_buffer_);
+    if (s.ok()) {
+      seq = first_seq;
+      for (Writer* g : group) {
+        WriteBatchInternal::Iterate(WriteBatchInternal::Contents(*g->batch),
+                                    [&](RecordType type, std::string_view key, std::string_view value) {
+                                      mem->Add(seq++, type, key, value);
+                                    });
+      }
+    }
+    lock.lock();
+
+    if (s.ok()) {
+      last_sequence_ = seq - 1;  // Publish: the group becomes visible at once.
+      stats_.writes += group.size();
+      stats_.write_groups++;
+      for (Writer* g : group) stats_.user_bytes_written += g->user_bytes;
+    } else {
+      write_error_ = s;
+    }
   }
-  if (type == RecordType::kPut) {
-    mem_->Put(seq, key, value);
-  } else {
-    mem_->Delete(seq, key);
+
+  // Hand results to every writer in the group, then wake the next leader.
+  while (true) {
+    Writer* ready = writers_.front();
+    writers_.pop_front();
+    if (ready != &w) {
+      ready->status = s;
+      ready->done = true;
+      ready->cv.notify_one();
+    }
+    if (ready == last) break;
   }
-  next_seq_++;
-  user_bytes_written_ += key.size() + value.size();
-  return Status::OK();
+  if (!writers_.empty()) writers_.front()->cv.notify_one();
+  return s;
 }
 
-Status DBImpl::Get(std::string_view key, std::string* value) {
+Status DBImpl::Get(const ReadOptions& options, std::string_view key, std::string* value) {
   std::shared_ptr<MemTable> mem, imm;
   std::shared_ptr<const Version> v;
+  uint64_t seq;
   {
     std::lock_guard lock(mu_);
     mem = mem_;
     imm = imm_;
     v = current_;
+    seq = options.snapshot ? SnapshotSeq(options.snapshot) : last_sequence_;
   }
 
-  // Search newest to oldest; the first layer with an entry for key decides.
-  LookupResult r = mem->Get(key, value);
-  if (r == LookupResult::kMissing && imm) r = imm->Get(key, value);
+  // Search newest to oldest; the first layer with a version of key visible
+  // at seq decides.
+  LookupResult r = mem->Get(key, seq, value);
+  if (r == LookupResult::kMissing && imm) r = imm->Get(key, seq, value);
   for (int level = 0; level < kNumLevels && r == LookupResult::kMissing; level++) {
     const auto& files = v->levels[level];
     if (level == 0) {
       for (const FileEntry& f : files) {
         if (!Overlaps(f.meta, key, key)) continue;
-        Status s = f.table->Get(key, value, &r);
+        Status s = f.table->Get(key, seq, value, &r);
         if (!s.ok()) return s;
         if (r != LookupResult::kMissing) break;
       }
@@ -883,7 +994,7 @@ Status DBImpl::Get(std::string_view key, std::string* value) {
         return std::string_view(f.meta.largest) < k;
       });
       if (it != files.end() && std::string_view(it->meta.smallest) <= key) {
-        Status s = it->table->Get(key, value, &r);
+        Status s = it->table->Get(key, seq, value, &r);
         if (!s.ok()) return s;
       }
     }
@@ -891,11 +1002,59 @@ Status DBImpl::Get(std::string_view key, std::string* value) {
   return r == LookupResult::kFound ? Status::OK() : Status::NotFound();
 }
 
+std::unique_ptr<Iterator> DBImpl::NewIterator(const ReadOptions& options) {
+  std::shared_ptr<MemTable> mem, imm;
+  std::shared_ptr<const Version> v;
+  uint64_t seq;
+  {
+    std::lock_guard lock(mu_);
+    mem = mem_;
+    imm = imm_;
+    v = current_;
+    seq = options.snapshot ? SnapshotSeq(options.snapshot) : last_sequence_;
+  }
+
+  // One child per memtable, per level-0 table (they overlap), and per deeper
+  // level (each a sorted run). The iterator pins the memtables and Version,
+  // so flushes and compactions cannot pull data out from under it.
+  std::vector<std::unique_ptr<InternalIterator>> children;
+  children.push_back(mem->NewIterator());
+  if (imm) children.push_back(imm->NewIterator());
+  for (const FileEntry& f : v->levels[0]) children.push_back(std::make_unique<Table::Iterator>(f.table.get()));
+  for (int level = 1; level < kNumLevels; level++) {
+    if (!v->levels[level].empty()) children.push_back(NewLevelIterator(v->levels[level]));
+  }
+  std::vector<std::shared_ptr<const void>> pins{mem, v};
+  if (imm) pins.push_back(imm);
+  return NewDBIterator(NewMergingIterator(std::move(children)), seq, std::move(pins));
+}
+
+const Snapshot* DBImpl::GetSnapshot() {
+  std::lock_guard lock(mu_);
+  snapshots_.insert(last_sequence_);
+  return new SnapshotImpl(last_sequence_);
+}
+
+void DBImpl::ReleaseSnapshot(const Snapshot* snapshot) {
+  if (snapshot == nullptr) return;
+  {
+    std::lock_guard lock(mu_);
+    snapshots_.erase(snapshots_.find(SnapshotSeq(snapshot)));
+  }
+  delete static_cast<const SnapshotImpl*>(snapshot);
+}
+
 Status DBImpl::Flush() {
   {
-    std::lock_guard lock(write_mu_);
-    if (!write_error_.ok()) return write_error_;
-    Status s = MakeRoomForWrite(/*force=*/true);
+    // Queue as a writer so the memtable switch is ordered with writes.
+    Writer w;
+    std::unique_lock lock(mu_);
+    writers_.push_back(&w);
+    while (!w.done && &w != writers_.front()) w.cv.wait(lock);
+    Status s = write_error_;
+    if (s.ok()) s = MakeRoomForWrite(lock, /*force=*/true);
+    writers_.pop_front();
+    if (!writers_.empty()) writers_.front()->cv.notify_one();
     if (!s.ok()) return s;
   }
   std::unique_lock lock(mu_);
@@ -932,15 +1091,19 @@ Status DBImpl::Verify() {
       if (level > 0 && i > 0 && !(files[i - 1].meta.largest < m.smallest)) {
         return fail(m, "overlaps its neighbor");
       }
-      std::string prev;
+      std::string prev_key;
+      uint64_t prev_seq = 0;
       bool first = true;
       Table::Iterator it(files[i].table.get());
       for (it.SeekToFirst(); it.Valid(); it.Next()) {
-        if (!first && !(std::string_view(prev) < it.key())) return fail(m, "keys out of order");
+        if (!first && CompareInternal(prev_key, prev_seq, it.key(), it.seq()) >= 0) {
+          return fail(m, "entries out of order");
+        }
         if (it.key() < std::string_view(m.smallest) || it.key() > std::string_view(m.largest)) {
           return fail(m, "key outside recorded range");
         }
-        prev.assign(it.key());
+        prev_key.assign(it.key());
+        prev_seq = it.seq();
         first = false;
       }
       if (!it.status().ok()) return it.status();
@@ -960,7 +1123,6 @@ DBStats DBImpl::GetStats() {
     stats.num_tables += stats.files_per_level[level];
     stats.table_bytes += stats.bytes_per_level[level];
   }
-  stats.user_bytes_written = user_bytes_written_;
   return stats;
 }
 

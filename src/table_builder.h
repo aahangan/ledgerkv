@@ -10,7 +10,8 @@
 
 namespace ledgerkv {
 
-// Writes a sorted table file. Keys must be added in strictly increasing order.
+// Writes a sorted table file. Entries must be added in strictly increasing
+// internal order: user key ascending, then sequence descending.
 // The file is complete and durable once Finish() returns OK. A partially
 // written file is never referenced from the MANIFEST and is deleted as an
 // orphan on the next open.
@@ -37,6 +38,7 @@ class TableBuilder {
 
   uint64_t FileSize() const { return offset_; }
   uint64_t NumEntries() const { return num_entries_; }
+  // Smallest and largest user keys added so far.
   const std::string& SmallestKey() const { return smallest_; }
   const std::string& LargestKey() const { return last_key_; }
 
@@ -53,6 +55,7 @@ class TableBuilder {
   uint64_t num_entries_ = 0;
   std::string smallest_;
   std::string last_key_;
+  uint64_t last_seq_ = 0;
 
   std::string data_block_;
   std::string index_block_;

@@ -10,6 +10,10 @@
 //   readrandom   random reads of written keys, served from tables on disk
 //   readmissing  random reads of absent keys that fall between stored keys, so
 //                key-range checks cannot skip tables and the bloom filters must
+//   readrandom   (8 threads) the same reads spread across 8 threads
+//   scan         full iterator scan
+//   seekrandom   seek to a random key, then read the next 10
+//   syncwrite    fsynced writes from T concurrent threads (group commit)
 
 #include <sys/resource.h>
 #include <unistd.h>
@@ -23,6 +27,7 @@
 #include <functional>
 #include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "ledgerkv/db.h"
@@ -55,6 +60,30 @@ void Run(const char* name, uint64_t num, const std::function<void(uint64_t)>& op
     lat_us.push_back(std::chrono::duration<double, std::micro>(Clock::now() - t0).count());
   }
   Report(name, lat_us, std::chrono::duration<double>(Clock::now() - start).count());
+}
+
+// Runs ops_per_thread calls of op on each of threads threads and reports
+// aggregate throughput with per-operation latency percentiles.
+void RunThreads(const char* name, int threads, uint64_t ops_per_thread,
+                const std::function<void(int thread, uint64_t i)>& op) {
+  std::vector<std::vector<double>> lat(threads);
+  auto start = Clock::now();
+  std::vector<std::thread> workers;
+  for (int t = 0; t < threads; t++) {
+    workers.emplace_back([&, t] {
+      lat[t].reserve(ops_per_thread);
+      for (uint64_t i = 0; i < ops_per_thread; i++) {
+        auto t0 = Clock::now();
+        op(t, i);
+        lat[t].push_back(std::chrono::duration<double, std::micro>(Clock::now() - t0).count());
+      }
+    });
+  }
+  for (auto& w : workers) w.join();
+  double total_s = std::chrono::duration<double>(Clock::now() - start).count();
+  std::vector<double> all;
+  for (auto& l : lat) all.insert(all.end(), l.begin(), l.end());
+  Report(name, all, total_s);
 }
 
 void Check(const Status& s) {
@@ -91,6 +120,7 @@ void PrintStats(DB* db, uint64_t live_bytes) {
 
 int main(int argc, char** argv) {
   uint64_t num = 1000000;
+  uint64_t sync_ops = 100;  // Per thread, per syncwrite run.
   size_t value_size = 100;
   size_t write_buffer_mb = 4;
   bool sync = false;
@@ -101,10 +131,12 @@ int main(int argc, char** argv) {
     else if (arg == "--value-size" && i + 1 < argc) value_size = std::strtoull(argv[++i], nullptr, 10);
     else if (arg == "--write-buffer-mb" && i + 1 < argc) write_buffer_mb = std::strtoull(argv[++i], nullptr, 10);
     else if (arg == "--sync") sync = true;
+    else if (arg == "--sync-ops" && i + 1 < argc) sync_ops = std::strtoull(argv[++i], nullptr, 10);
     else if (arg == "--dir" && i + 1 < argc) dir = argv[++i];
     else {
       std::fprintf(stderr,
-                   "usage: kvbench [--num N] [--value-size BYTES] [--sync] [--write-buffer-mb MB] [--dir DIR]\n");
+                   "usage: kvbench [--num N] [--value-size BYTES] [--sync] [--write-buffer-mb MB] "
+                   "[--sync-ops N] [--dir DIR]\n");
       return 2;
     }
   }
@@ -162,7 +194,50 @@ int main(int argc, char** argv) {
   std::string out;
   Run("readrandom", num, [&](uint64_t) { Check(db->Get(Key(rng() % num), &out)); });
   Run("readmissing", num, [&](uint64_t) { Check(db->Get(Key(rng() % num) + "!", &out)); });
+  RunThreads("readrandom8", 8, num / 8, [&](int t, uint64_t i) {
+    std::string v;
+    Check(db->Get(Key(std::hash<uint64_t>()(i * 8 + static_cast<uint64_t>(t)) % num), &v));
+  });
+
+  {
+    auto it = db->NewIterator();
+    uint64_t entries = 0, bytes = 0;
+    auto t1 = Clock::now();
+    for (it->SeekToFirst(); it->Valid(); it->Next()) {
+      entries++;
+      bytes += it->key().size() + it->value().size();
+    }
+    Check(it->status());
+    double secs = std::chrono::duration<double>(Clock::now() - t1).count();
+    std::printf("%-12s %10.0f entries/s   %.0f MB/s   (%llu entries)\n", "scan", entries / secs,
+                bytes / 1048576.0 / secs, static_cast<unsigned long long>(entries));
+    Run("seekrandom", num / 10, [&](uint64_t) {
+      it->Seek(Key(rng() % num));
+      for (int j = 0; j < 10 && it->Valid(); j++) it->Next();
+      Check(it->status());
+    });
+  }
   db.reset();
+  std::filesystem::remove_all(dir);
+
+  // Group commit: every write is fsynced before it is acknowledged, from T
+  // concurrent writers. One fsync can cover every writer queued behind it.
+  std::printf("syncwrite: every write fsynced (F_FULLFSYNC on macOS), %llu writes per thread\n",
+              static_cast<unsigned long long>(sync_ops));
+  for (int threads : {1, 4, 16, 64}) {
+    std::filesystem::remove_all(dir);
+    Options sync_options = options;
+    sync_options.sync = true;
+    std::unique_ptr<DB> sdb;
+    Check(DB::Open(sync_options, dir, &sdb));
+    char name[32];
+    std::snprintf(name, sizeof(name), "sync x%d", threads);
+    RunThreads(name, threads, sync_ops, [&](int t, uint64_t i) {
+      Check(sdb->Put(Key(static_cast<uint64_t>(t) * 1000000 + i), value));
+    });
+    DBStats st = sdb->GetStats();
+    std::printf("             %.1f writes per fsync\n", static_cast<double>(st.writes) / st.write_groups);
+  }
   std::filesystem::remove_all(dir);
   return 0;
 }

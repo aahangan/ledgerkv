@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "dbformat.h"
+#include "internal_iterator.h"
 #include "ledgerkv/status.h"
 
 namespace ledgerkv {
@@ -16,7 +17,7 @@ namespace ledgerkv {
 // into memory; Get() costs at most one pread() of a single data block, and
 // none at all when the bloom filter rules the key out.
 //
-// Thread-safe: Get() and ForEach() may be called concurrently.
+// Thread-safe: Get() and iterators may be used concurrently.
 class Table {
  public:
   static Status Open(const std::string& path, uint64_t file_size, std::shared_ptr<Table>* out);
@@ -25,25 +26,27 @@ class Table {
   Table(const Table&) = delete;
   Table& operator=(const Table&) = delete;
 
-  Status Get(std::string_view key, std::string* value, LookupResult* result) const;
+  // Looks up the newest version of key with sequence <= snapshot.
+  Status Get(std::string_view key, uint64_t snapshot, std::string* value, LookupResult* result) const;
 
-  // Sequential scan over a table in key order, holding one block in memory.
-  // The table must outlive the iterator.
-  class Iterator {
+  // Scans the table in internal order, holding one block in memory. The
+  // table must outlive the iterator.
+  class Iterator final : public InternalIterator {
    public:
     explicit Iterator(const Table* table) : table_(table) {}
 
-    void SeekToFirst();
-    bool Valid() const { return valid_; }
-    void Next();
+    void SeekToFirst() override;
+    void Seek(std::string_view target) override { SeekInternal(target, kMaxSequence); }
+    // Positions at the first entry at or after (target, seq) in internal order.
+    void SeekInternal(std::string_view target, uint64_t seq);
+    void Next() override { ParseNextEntry(); }
+    bool Valid() const override { return valid_; }
 
-    std::string_view key() const { return key_; }
-    uint64_t seq() const { return seq_; }
-    RecordType type() const { return type_; }
-    std::string_view value() const { return value_; }
-
-    // Non-OK if iteration stopped because of an I/O error or corruption.
-    const Status& status() const { return status_; }
+    std::string_view key() const override { return key_; }
+    uint64_t seq() const override { return seq_; }
+    RecordType type() const override { return type_; }
+    std::string_view value() const override { return value_; }
+    Status status() const override { return status_; }
 
    private:
     bool LoadBlock(size_t index);
@@ -60,7 +63,7 @@ class Table {
     Status status_;
   };
 
-  // Visits every entry in key order. Stops early if fn returns false.
+  // Visits every entry in internal order. Stops early if fn returns false.
   using Visitor = std::function<bool(std::string_view key, uint64_t seq, RecordType type,
                                      std::string_view value)>;
   Status ForEach(const Visitor& fn) const;
@@ -68,6 +71,7 @@ class Table {
  private:
   struct IndexEntry {
     std::string last_key;
+    uint64_t last_seq;
     uint64_t offset;
     uint64_t size;
   };

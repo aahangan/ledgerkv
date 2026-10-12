@@ -1,54 +1,60 @@
 #pragma once
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
-#include <map>
-#include <shared_mutex>
+#include <memory>
 #include <string>
 #include <string_view>
 
+#include "arena.h"
 #include "dbformat.h"
+#include "internal_iterator.h"
+#include "skiplist.h"
 
 namespace ledgerkv {
 
-// In-memory sorted buffer of recent writes. Deletes are kept as tombstones so
-// that they shadow older values in tables on disk.
+// In-memory sorted buffer of recent writes, holding every version of every
+// key (so snapshots can read old ones) and tombstones (so deletes shadow
+// older values on disk).
 //
-// Thread-safe: concurrent readers, exclusive writers.
+// Backed by a skiplist: one writer at a time (the write path serializes
+// Add() calls), and any number of concurrent lock-free readers.
 class MemTable {
  public:
-  void Put(uint64_t seq, std::string_view key, std::string_view value);
-  void Delete(uint64_t seq, std::string_view key);
-  LookupResult Get(std::string_view key, std::string* value) const;
+  MemTable() : table_(KeyComparator(), &arena_) {}
+  MemTable(const MemTable&) = delete;
+  MemTable& operator=(const MemTable&) = delete;
 
-  // Visits every entry in key order. Holds a read lock for the duration.
-  using Visitor =
-      std::function<void(std::string_view key, uint64_t seq, RecordType type, std::string_view value)>;
-  void ForEach(const Visitor& fn) const;
+  // Requires external serialization against other Add() calls. Each seq is
+  // used once.
+  void Add(uint64_t seq, RecordType type, std::string_view key, std::string_view value);
 
-  size_t ApproximateBytes() const;
-  size_t Size() const;
+  // Looks up the newest version of key with sequence <= snapshot.
+  LookupResult Get(std::string_view key, uint64_t snapshot, std::string* value) const;
+
+  // Iterates every entry in internal order. The memtable must outlive it.
+  std::unique_ptr<InternalIterator> NewIterator() const;
+
+  size_t ApproximateBytes() const { return arena_.MemoryUsage(); }
+  size_t Size() const { return count_.load(std::memory_order_acquire); }
   bool Empty() const { return Size() == 0; }
-  uint64_t MaxSequence() const;
+  uint64_t MaxSequence() const { return max_seq_.load(std::memory_order_acquire); }
 
  private:
-  struct Entry {
-    uint64_t seq;
-    bool deleted;
-    std::string value;
+  // Entries are stored in the arena as:
+  //   varint klen | key | fixed64 tag | varint vlen | value
+  // and the skiplist holds pointers to them.
+  struct KeyComparator {
+    int operator()(const char* a, const char* b) const;
   };
+  using Table = SkipList<const char*, KeyComparator>;
+  class Iter;
 
-  // Per-entry bookkeeping cost in the std::map, so that many tiny writes
-  // still trigger a flush at a sensible point.
-  static constexpr size_t kEntryOverhead = 64;
-
-  void Insert(uint64_t seq, std::string_view key, std::string_view value, bool deleted);
-
-  mutable std::shared_mutex mu_;
-  std::map<std::string, Entry, std::less<>> entries_;
-  size_t bytes_ = 0;
-  uint64_t max_seq_ = 0;
+  Arena arena_;
+  Table table_;
+  std::atomic<size_t> count_{0};
+  std::atomic<uint64_t> max_seq_{0};
 };
 
 }  // namespace ledgerkv

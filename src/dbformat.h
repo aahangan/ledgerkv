@@ -19,3 +19,23 @@ inline uint64_t TagSequence(uint64_t tag) { return tag >> 8; }
 inline RecordType TagType(uint64_t tag) { return static_cast<RecordType>(tag & 0xFF); }
 
 }  // namespace ledgerkv
+
+#include <string_view>
+
+namespace ledgerkv {
+
+// Sequence numbers fit in the 56 bits above the type byte of a tag.
+constexpr uint64_t kMaxSequence = (uint64_t{1} << 56) - 1;
+
+// Internal ordering of (user key, sequence) pairs: user key ascending, then
+// sequence descending, so the newest version of a key comes first. Every
+// sorted structure (memtable, table, merge) uses this order.
+inline int CompareInternal(std::string_view key_a, uint64_t seq_a, std::string_view key_b, uint64_t seq_b) {
+  int c = key_a.compare(key_b);
+  if (c != 0) return c;
+  if (seq_a > seq_b) return -1;
+  if (seq_a < seq_b) return 1;
+  return 0;
+}
+
+}  // namespace ledgerkv

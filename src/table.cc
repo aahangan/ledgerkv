@@ -82,7 +82,10 @@ Status Table::Open(const std::string& path, uint64_t file_size, std::shared_ptr<
   while (!in.empty()) {
     std::string_view last_key;
     IndexEntry e;
-    if (!GetLengthPrefixed(&in, &last_key) || !GetVarint64(&in, &e.offset) || !GetVarint64(&in, &e.size)) {
+    if (!GetLengthPrefixed(&in, &last_key) || in.size() < 8) return Status::Corruption("bad index block in " + path);
+    e.last_seq = TagSequence(DecodeFixed64(in.data()));
+    in.remove_prefix(8);
+    if (!GetVarint64(&in, &e.offset) || !GetVarint64(&in, &e.size)) {
       return Status::Corruption("bad index block in " + path);
     }
     e.last_key.assign(last_key);
@@ -92,34 +95,23 @@ Status Table::Open(const std::string& path, uint64_t file_size, std::shared_ptr<
   return Status::OK();
 }
 
-Status Table::Get(std::string_view key, std::string* value, LookupResult* result) const {
+Status Table::Get(std::string_view key, uint64_t snapshot, std::string* value, LookupResult* result) const {
   *result = LookupResult::kMissing;
   if (!BloomMayContain(filter_, key)) return Status::OK();
 
-  // The first block whose last key is >= key is the only one that can hold it.
-  auto it = std::lower_bound(index_.begin(), index_.end(), key,
-                             [](const IndexEntry& e, std::string_view k) { return e.last_key < k; });
-  if (it == index_.end()) return Status::OK();
-
-  std::string block;
-  Status s = ReadBlock(it->offset, it->size, &block);
-  if (!s.ok()) return s;
-  std::string_view in = block;
-  while (!in.empty()) {
-    Entry e;
-    if (!ParseEntry(&in, &e)) return Status::Corruption("bad data block in " + path_);
-    if (e.key < key) continue;
-    if (e.key == key) {
-      if (TagType(e.tag) == RecordType::kDelete) {
-        *result = LookupResult::kDeleted;
-      } else {
-        value->assign(e.value);
-        *result = LookupResult::kFound;
-      }
+  // The first entry at or after (key, snapshot) is the newest version of key
+  // visible at snapshot, if any version is.
+  Iterator it(this);
+  it.SeekInternal(key, snapshot);
+  if (it.Valid() && it.key() == key) {
+    if (it.type() == RecordType::kDelete) {
+      *result = LookupResult::kDeleted;
+    } else {
+      value->assign(it.value());
+      *result = LookupResult::kFound;
     }
-    break;
   }
-  return Status::OK();
+  return it.status();
 }
 
 bool Table::Iterator::LoadBlock(size_t index) {
@@ -159,7 +151,20 @@ void Table::Iterator::SeekToFirst() {
   ParseNextEntry();
 }
 
-void Table::Iterator::Next() { ParseNextEntry(); }
+void Table::Iterator::SeekInternal(std::string_view target, uint64_t seq) {
+  status_ = Status::OK();
+  valid_ = false;
+  // The first block whose last entry is >= the target holds the first entry
+  // >= the target.
+  const auto& index = table_->index_;
+  auto it = std::lower_bound(index.begin(), index.end(), 0, [&](const IndexEntry& e, int) {
+    return CompareInternal(e.last_key, e.last_seq, target, seq) < 0;
+  });
+  if (it == index.end() || !LoadBlock(static_cast<size_t>(it - index.begin()))) return;
+  do {
+    ParseNextEntry();
+  } while (valid_ && CompareInternal(key_, seq_, target, seq) < 0);
+}
 
 Status Table::ForEach(const Visitor& fn) const {
   Iterator it(this);

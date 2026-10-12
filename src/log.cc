@@ -38,6 +38,12 @@ Status LogWriter::AddRecord(std::string_view payload) {
   return s;
 }
 
+Status LogWriter::AddFramedRecords(std::string_view framed) {
+  Status s = WriteAll(fd_, framed.data(), framed.size(), path_);
+  if (s.ok() && sync_) s = SyncFd(fd_, path_);
+  return s;
+}
+
 Status ReadLog(const std::string& path, const std::function<bool(std::string_view)>& fn,
                LogReadStats* stats) {
   *stats = LogReadStats();
