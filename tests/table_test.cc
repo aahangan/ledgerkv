@@ -5,6 +5,7 @@
 #include <string>
 
 #include "bloom.h"
+#include "crc32c.h"
 #include "file_util.h"
 #include "table.h"
 #include "table_builder.h"
@@ -178,4 +179,50 @@ TEST(VersionEditRoundTrip) {
   CHECK_EQ(d.added_tables[1].largest, std::string("\0\xff", 2));
   CHECK_EQ(d.deleted_tables.size(), 2u);
   CHECK(!d.DecodeFrom(enc.substr(0, enc.size() - 1)));
+}
+
+namespace {
+
+// Writes a table file whose footer is given directly, after `body` bytes.
+std::string WriteRawTable(const std::string& body, uint64_t filter_offset, uint64_t filter_size,
+                          uint64_t index_offset, uint64_t index_size) {
+  std::string path = testing::TempDir() + "/crafted.sst";
+  std::string file = body;
+  for (uint64_t v : {filter_offset, filter_size, index_offset, index_size, uint64_t{0x6C6564676572'6B32ULL}}) {
+    for (int i = 0; i < 8; i++) file.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
+  }
+  int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  CHECK(fd >= 0);
+  CHECK_OK(WriteAll(fd, file.data(), file.size(), path));
+  ::close(fd);
+  return path;
+}
+
+}  // namespace
+
+// A footer whose offset + size arithmetic wraps around 2^64 can pass a
+// naive "offset + size + trailer == file size" check and then make the
+// reader index far outside its buffer. Found while chasing a CI fuzzer
+// failure; the reader must reject it as corruption.
+TEST(TableRejectsOverflowingFooter) {
+  // A valid 56-byte filter block (with its checksum) fills [0, 60), so the
+  // reader gets past the filter and reaches the index. The footer goes at
+  // offset 60; the file is 100 bytes.
+  std::string body(56, '\0');
+  uint32_t crc = crc32c::Value(body.data(), body.size());
+  for (int i = 0; i < 4; i++) body.push_back(static_cast<char>((crc >> (8 * i)) & 0xFF));
+  const uint64_t index_size = ~uint64_t{0} - 3;             // 2^64 - 4
+  const uint64_t index_offset = 100 - 40 - 4 - index_size;  // Wraps around to 60.
+  std::string path = WriteRawTable(body, 0, 56, index_offset, index_size);
+  std::shared_ptr<Table> t;
+  Status s = Table::Open(path, 100, &t);
+  CHECK(s.IsCorruption());
+}
+
+// Block sizes in the footer or index that point past the end of the file
+// must be rejected before anything is allocated or read.
+TEST(TableRejectsBlocksPastEndOfFile) {
+  std::string path = WriteRawTable(std::string(60, '\0'), 0, 1ULL << 40, 1ULL << 40, 16);
+  std::shared_ptr<Table> t;
+  CHECK(Table::Open(path, 100, &t).IsCorruption());
 }

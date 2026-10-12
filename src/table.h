@@ -77,13 +77,14 @@ class Table {
     uint64_t size;
   };
 
-  Table(std::string path, std::unique_ptr<RandomAccessFile> file)
-      : path_(std::move(path)), file_(std::move(file)) {}
+  Table(std::string path, std::unique_ptr<RandomAccessFile> file, uint64_t file_size)
+      : path_(std::move(path)), file_(std::move(file)), file_size_(file_size) {}
 
   Status ReadBlock(uint64_t offset, uint64_t size, std::string* out) const;
 
   const std::string path_;
   const std::unique_ptr<RandomAccessFile> file_;
+  const uint64_t file_size_;
   std::string filter_;
   std::vector<IndexEntry> index_;
 };

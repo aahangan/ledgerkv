@@ -26,6 +26,14 @@ bool ParseEntry(std::string_view* in, Entry* e) {
 }  // namespace
 
 Status Table::ReadBlock(uint64_t offset, uint64_t size, std::string* out) const {
+  // Offsets and sizes come from the file itself, so a corrupt or malicious
+  // table can claim anything. Check that the block and its trailer lie
+  // inside the file before allocating or reading, using subtraction so that
+  // no sum can overflow and wrap around.
+  if (size > file_size_ || kBlockTrailerSize > file_size_ - size ||
+      offset > file_size_ - size - kBlockTrailerSize) {
+    return Status::Corruption("block extends past end of " + path_);
+  }
   Status s = file_->Read(offset, size + kBlockTrailerSize, out);
   if (!s.ok()) return s;
   if (out->size() != size + kBlockTrailerSize) return Status::Corruption("truncated block in " + path_);
@@ -41,7 +49,7 @@ Status Table::Open(const std::string& path, uint64_t file_size, std::shared_ptr<
   std::unique_ptr<RandomAccessFile> file;
   Status fs = env->NewRandomAccessFile(path, &file);
   if (!fs.ok()) return fs;
-  std::shared_ptr<Table> t(new Table(path, std::move(file)));
+  std::shared_ptr<Table> t(new Table(path, std::move(file), file_size));
   if (file_size < kFooterSize) return Status::Corruption("table too small: " + path);
 
   std::string footer;
@@ -52,8 +60,15 @@ Status Table::Open(const std::string& path, uint64_t file_size, std::shared_ptr<
   uint64_t filter_offset = DecodeFixed64(f), filter_size = DecodeFixed64(f + 8);
   uint64_t index_offset = DecodeFixed64(f + 16), index_size = DecodeFixed64(f + 24);
   if (DecodeFixed64(f + 32) != kTableMagic) return Status::Corruption("bad magic in " + path);
-  if (index_offset + index_size + kBlockTrailerSize + kFooterSize != file_size ||
-      filter_offset + filter_size + kBlockTrailerSize != index_offset) {
+  // The index block (plus trailer) must end exactly at the footer, and the
+  // filter block (plus trailer) exactly at the index. Written as
+  // subtractions after range checks, because the obvious sums can overflow
+  // and wrap around to pass with absurd values.
+  const uint64_t blocks_end = file_size - kFooterSize;
+  if (index_size > blocks_end || blocks_end - index_size < kBlockTrailerSize ||
+      index_offset != blocks_end - index_size - kBlockTrailerSize || filter_size > index_offset ||
+      index_offset - filter_size < kBlockTrailerSize ||
+      filter_offset != index_offset - filter_size - kBlockTrailerSize) {
     return Status::Corruption("bad footer in " + path);
   }
 

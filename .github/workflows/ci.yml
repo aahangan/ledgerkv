@@ -50,11 +50,28 @@ jobs:
       - name: Fuzz for 60 seconds per target
         run: |
           for t in log write_batch table db; do
-            ./build/fuzz_$t corpus/$t -max_total_time=60 -timeout=10 -print_final_stats=1
+            set +e
+            ./build/fuzz_$t corpus/$t -max_total_time=60 -timeout=10 -print_final_stats=1 2>&1 | tee fuzz-$t.log
+            status=${PIPESTATUS[0]}
+            set -e
+            if [ "$status" -ne 0 ]; then
+              # Annotations are public even when logs need a sign-in, so put
+              # the diagnosis and the crashing input (base64) there.
+              echo "::error title=fuzz_$t failed::$(grep -E 'ERROR|SUMMARY|FUZZ_CHECK|deadly|exceeds' fuzz-$t.log | head -5 | tr '\n' ' ')"
+              for f in crash-* oom-* timeout-* leak-*; do
+                [ -f "$f" ] && echo "::error title=fuzz_$t input $f (base64)::$(base64 -w0 "$f" | head -c 4000)"
+              done
+              exit 1
+            fi
           done
       - name: Keep crashing inputs
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-crashes
-          path: crash-*
+          path: |
+            crash-*
+            oom-*
+            timeout-*
+            leak-*
+            fuzz-*.log
