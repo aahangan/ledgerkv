@@ -30,6 +30,7 @@ void VersionEdit::EncodeTo(std::string* dst) const {
   }
   for (const TableMeta& t : added_tables) {
     PutVarint32(dst, kAddedTable);
+    PutVarint32(dst, static_cast<uint32_t>(t.level));
     PutVarint64(dst, t.number);
     PutVarint64(dst, t.file_size);
     PutLengthPrefixed(dst, t.smallest);
@@ -62,11 +63,13 @@ bool VersionEdit::DecodeFrom(std::string_view in) {
         break;
       case kAddedTable: {
         TableMeta t;
+        uint32_t level;
         std::string_view smallest, largest;
-        if (!GetVarint64(&in, &t.number) || !GetVarint64(&in, &t.file_size) ||
+        if (!GetVarint32(&in, &level) || level >= 7 || !GetVarint64(&in, &t.number) || !GetVarint64(&in, &t.file_size) ||
             !GetLengthPrefixed(&in, &smallest) || !GetLengthPrefixed(&in, &largest)) {
           return false;
         }
+        t.level = static_cast<int>(level);
         t.smallest.assign(smallest);
         t.largest.assign(largest);
         added_tables.push_back(std::move(t));

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -10,11 +11,24 @@
 
 namespace ledgerkv {
 
+constexpr int kNumLevels = 7;
+
 struct DBStats {
+  std::array<uint64_t, kNumLevels> files_per_level{};
+  std::array<uint64_t, kNumLevels> bytes_per_level{};
   uint64_t num_tables = 0;
   uint64_t table_bytes = 0;
+
+  // Counters since this DB was opened.
   uint64_t flushes = 0;
-  // Total time writers spent blocked waiting for a flush to free the memtable.
+  uint64_t compactions = 0;
+  uint64_t trivial_moves = 0;      // Compactions done by relinking a table, no rewrite.
+  uint64_t tombstones_dropped = 0;
+  uint64_t user_bytes_written = 0;  // Key and value bytes passed to Put/Delete.
+  uint64_t flush_bytes_written = 0;
+  uint64_t compaction_bytes_read = 0;
+  uint64_t compaction_bytes_written = 0;
+  // Total time writers spent slowed or blocked waiting on background work.
   uint64_t stall_micros = 0;
 };
 
@@ -36,6 +50,15 @@ class DB {
 
   // Flushes the memtable to a table and waits for it to finish.
   virtual Status Flush() = 0;
+
+  // Flushes, then compacts every level into the next until all data sits in
+  // the bottom level, dropping overwritten values and tombstones.
+  virtual Status CompactAll() = 0;
+
+  // Checks structural invariants: levels 1+ are sorted and non-overlapping,
+  // every table's keys are strictly increasing and within its recorded
+  // range, and every block's checksum matches. Reads every table in full.
+  virtual Status Verify() = 0;
 
   virtual DBStats GetStats() = 0;
 };

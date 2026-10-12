@@ -7,8 +7,9 @@
 //   fillrandom   random inserts into an empty database
 //   overwrite    random updates of existing keys
 //   reopen       close and reopen (recovery time)
-//   readrandom   random reads of existing keys, served from tables on disk
-//   readmissing  random reads of absent keys (exercises the bloom filters)
+//   readrandom   random reads of written keys, served from tables on disk
+//   readmissing  random reads of absent keys that fall between stored keys, so
+//                key-range checks cannot skip tables and the bloom filters must
 
 #include <sys/resource.h>
 #include <unistd.h>
@@ -63,11 +64,27 @@ void Check(const Status& s) {
   }
 }
 
-void PrintStats(DB* db) {
+// live_bytes: key + value bytes of the distinct live keys, for space amplification.
+void PrintStats(DB* db, uint64_t live_bytes) {
   DBStats st = db->GetStats();
-  std::printf("             tables %llu (%.1f MB), flushes %llu, writers stalled %.1f ms total\n",
-              static_cast<unsigned long long>(st.num_tables), st.table_bytes / 1048576.0,
-              static_cast<unsigned long long>(st.flushes), st.stall_micros / 1000.0);
+  std::printf("             levels:");
+  for (int l = 0; l < kNumLevels; l++) {
+    if (st.files_per_level[l] == 0) continue;
+    std::printf("  L%d %llu files %.1f MB", l, static_cast<unsigned long long>(st.files_per_level[l]),
+                st.bytes_per_level[l] / 1048576.0);
+  }
+  std::printf("\n             %.1f MB on disk for %.1f MB live (space amp %.2fx)\n", st.table_bytes / 1048576.0,
+              live_bytes / 1048576.0, static_cast<double>(st.table_bytes) / live_bytes);
+  if (st.user_bytes_written > 0) {
+    std::printf("             flushes %llu, compactions %llu (+%llu trivial moves), tombstones dropped %llu\n",
+                static_cast<unsigned long long>(st.flushes), static_cast<unsigned long long>(st.compactions),
+                static_cast<unsigned long long>(st.trivial_moves),
+                static_cast<unsigned long long>(st.tombstones_dropped));
+    std::printf("             write amp %.2fx (table bytes written / user bytes; WAL adds ~1x), "
+                "writers stalled %.0f ms\n",
+                static_cast<double>(st.flush_bytes_written + st.compaction_bytes_written) / st.user_bytes_written,
+                st.stall_micros / 1000.0);
+  }
 }
 
 }  // namespace
@@ -94,7 +111,7 @@ int main(int argc, char** argv) {
   if (dir.empty()) {
     dir = (std::filesystem::temp_directory_path() / ("ledgerkv-bench-" + std::to_string(::getpid()))).string();
   }
-  // Each table holds a file descriptor until compaction exists (milestone 3).
+  // Each open table holds a file descriptor.
   rlimit rl;
   if (::getrlimit(RLIMIT_NOFILE, &rl) == 0) {
     rl.rlim_cur = std::min<rlim_t>(rl.rlim_max, 65536);
@@ -123,20 +140,28 @@ int main(int argc, char** argv) {
   }
   std::filesystem::remove_all(dir);
   auto db = open();
-  Run("fillrandom", num, [&](uint64_t) { Check(db->Put(Key(rng() % num), value)); });
-  Run("overwrite", num, [&](uint64_t) { Check(db->Put(Key(rng() % num), value)); });
-  PrintStats(db.get());
+  std::vector<bool> written(num);
+  auto put_random = [&](uint64_t) {
+    uint64_t k = rng() % num;
+    written[k] = true;
+    Check(db->Put(Key(k), value));
+  };
+  Run("fillrandom", num, put_random);
+  Run("overwrite", num, put_random);
+  const uint64_t live_bytes =
+      static_cast<uint64_t>(std::count(written.begin(), written.end(), true)) * (16 + value_size);
+  PrintStats(db.get(), live_bytes);
 
   db.reset();
   auto t0 = Clock::now();
   db = open();
   std::printf("%-12s %10.1f ms   (replays at most one memtable of log, then flushes it)\n", "reopen",
               std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
-  PrintStats(db.get());
+  PrintStats(db.get(), live_bytes);
 
   std::string out;
   Run("readrandom", num, [&](uint64_t) { Check(db->Get(Key(rng() % num), &out)); });
-  Run("readmissing", num, [&](uint64_t) { Check(db->Get(Key(num + rng() % num), &out)); });
+  Run("readmissing", num, [&](uint64_t) { Check(db->Get(Key(rng() % num) + "!", &out)); });
   db.reset();
   std::filesystem::remove_all(dir);
   return 0;

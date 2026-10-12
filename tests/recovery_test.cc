@@ -58,8 +58,7 @@ TEST(FlushCreatesTablesAndBoundsLogs) {
   for (int i = 0; i < 20000; i++) CHECK_OK(db->Put(Key(i), Value(i, 1)));
   CHECK_OK(db->Flush());
   DBStats stats = db->GetStats();
-  CHECK(stats.num_tables >= 10);
-  CHECK_EQ(stats.num_tables, stats.flushes);
+  CHECK(stats.flushes >= 10);
   // Flushed logs are deleted; only the active one remains.
   CHECK_EQ(CountFiles(dir, FileType::kLog), 1);
   CHECK_EQ(CountFiles(dir, FileType::kTable), static_cast<int>(stats.num_tables));
@@ -182,7 +181,8 @@ TEST(DamagedManifestTailKeepsUnreferencedTables) {
   ::close(fd);
 
   auto db = Open(dir);
-  CHECK(CountFiles(dir, FileType::kTable) >= tables_before);
+  // The table the dropped edit named is set aside in lost/, not deleted.
+  CHECK_EQ(CountFiles(dir + "/lost", FileType::kTable), tables_before);
 }
 
 // A record with a valid checksum that does not parse is real corruption, not

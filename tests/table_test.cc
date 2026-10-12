@@ -161,8 +161,8 @@ TEST(VersionEditRoundTrip) {
   e.log_number = 7;
   e.next_file_number = 12;
   e.last_sequence = 123456789012ULL;
-  e.added_tables.push_back({9, 4096, "aaa", "mmm"});
-  e.added_tables.push_back({10, 1, "", std::string("\0\xff", 2)});
+  e.added_tables.push_back({1, 9, 4096, "aaa", "mmm"});
+  e.added_tables.push_back({6, 10, 1, "", std::string("\0\xff", 2)});
   e.deleted_tables = {3, 4};
   std::string enc;
   e.EncodeTo(&enc);
@@ -173,6 +173,8 @@ TEST(VersionEditRoundTrip) {
   CHECK_EQ(*d.next_file_number, 12u);
   CHECK_EQ(*d.last_sequence, 123456789012ULL);
   CHECK_EQ(d.added_tables.size(), 2u);
+  CHECK_EQ(d.added_tables[0].level, 1);
+  CHECK_EQ(d.added_tables[1].level, 6);
   CHECK_EQ(d.added_tables[1].largest, std::string("\0\xff", 2));
   CHECK_EQ(d.deleted_tables.size(), 2u);
   CHECK(!d.DecodeFrom(enc.substr(0, enc.size() - 1)));

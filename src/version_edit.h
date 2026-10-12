@@ -9,6 +9,7 @@
 namespace ledgerkv {
 
 struct TableMeta {
+  int level = 0;
   uint64_t number = 0;
   uint64_t file_size = 0;
   std::string smallest;

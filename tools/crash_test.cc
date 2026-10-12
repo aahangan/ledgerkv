@@ -10,9 +10,11 @@
 //     visible, and
 //   * the in-flight operation is either fully applied or absent, never torn.
 //
-// The memtable is kept small so that kills regularly land in the middle of a
-// background flush: while a table is half written, before or after its
-// MANIFEST edit, or while obsolete logs are being deleted.
+// The memtable and level sizes are kept small so that kills regularly land in
+// the middle of background work: a flush or compaction with tables half
+// written, before or after its MANIFEST edit, or while obsolete files are
+// being deleted. The final iteration also runs DB::Verify() to check level
+// invariants and every block checksum.
 //
 // SIGKILL models a process crash: data passed to write() survives in the page
 // cache. Power loss (losing unsynced data and tearing records mid-sector) is
@@ -140,8 +142,7 @@ int main(int argc, char** argv) {
   std::printf("crash_test: dir=%s seed=%llu sync=%d\n", dir.c_str(),
               static_cast<unsigned long long>(seed), sync);
 
-  // Without compaction (milestone 3) every flush adds a table and each table
-  // holds a file descriptor, so lift the soft limit as far as allowed.
+  // Each open table holds a file descriptor, so lift the soft limit.
   rlimit rl;
   if (::getrlimit(RLIMIT_NOFILE, &rl) == 0) {
     rl.rlim_cur = std::min<rlim_t>(rl.rlim_max, 65536);
@@ -151,6 +152,8 @@ int main(int argc, char** argv) {
   Options options;
   options.sync = sync;
   options.write_buffer_size = write_buffer_kb << 10;
+  options.max_bytes_for_level_base = options.write_buffer_size * 4;
+  options.target_file_size = options.write_buffer_size / 2;
 
   std::mt19937_64 rng(seed);
   uint64_t tables = 0;
@@ -206,7 +209,10 @@ int main(int argc, char** argv) {
 
     std::unique_ptr<DB> db;
     Status s = DB::Open(options, dir, &db);
-    if (!s.ok()) Fail("reopen failed");
+    if (!s.ok()) {
+      std::fprintf(stderr, "FAIL: reopen: %s\n", s.ToString().c_str());
+      return 1;
+    }
 
     // The op after last_acked may or may not have been applied when the kill
     // landed. Check that it is all-or-nothing, then reapply it (puts and
@@ -235,6 +241,13 @@ int main(int argc, char** argv) {
       if (key != k) CheckKey(db.get(), key, ExpectPresent(key, last_acked));
     }
     tables = db->GetStats().num_tables;
+    if (full) {
+      Status vs = db->Verify();
+      if (!vs.ok()) {
+        std::fprintf(stderr, "FAIL: Verify: %s\n", vs.ToString().c_str());
+        return 1;
+      }
+    }
 
     if (!Apply(db.get(), inflight).ok()) Fail("reapply failed");
     next_op = inflight + 1;

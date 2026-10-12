@@ -34,7 +34,7 @@ add_library(ledgerkv
 target_include_directories(ledgerkv PUBLIC include PRIVATE src)
 
 add_executable(ledgerkv_tests tests/test_main.cc tests/wal_test.cc tests/db_test.cc
-  tests/table_test.cc tests/recovery_test.cc)
+  tests/table_test.cc tests/recovery_test.cc tests/compaction_test.cc)
 target_link_libraries(ledgerkv_tests PRIVATE ledgerkv)
 target_include_directories(ledgerkv_tests PRIVATE src tests)
 

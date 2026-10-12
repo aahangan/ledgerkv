@@ -27,6 +27,39 @@ class Table {
 
   Status Get(std::string_view key, std::string* value, LookupResult* result) const;
 
+  // Sequential scan over a table in key order, holding one block in memory.
+  // The table must outlive the iterator.
+  class Iterator {
+   public:
+    explicit Iterator(const Table* table) : table_(table) {}
+
+    void SeekToFirst();
+    bool Valid() const { return valid_; }
+    void Next();
+
+    std::string_view key() const { return key_; }
+    uint64_t seq() const { return seq_; }
+    RecordType type() const { return type_; }
+    std::string_view value() const { return value_; }
+
+    // Non-OK if iteration stopped because of an I/O error or corruption.
+    const Status& status() const { return status_; }
+
+   private:
+    bool LoadBlock(size_t index);
+    void ParseNextEntry();
+
+    const Table* table_;
+    size_t block_index_ = 0;
+    std::string block_;
+    std::string_view rest_;
+    std::string_view key_, value_;
+    uint64_t seq_ = 0;
+    RecordType type_ = RecordType::kPut;
+    bool valid_ = false;
+    Status status_;
+  };
+
   // Visits every entry in key order. Stops early if fn returns false.
   using Visitor = std::function<bool(std::string_view key, uint64_t seq, RecordType type,
                                      std::string_view value)>;

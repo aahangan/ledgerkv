@@ -24,9 +24,12 @@ std::string TableFileName(const std::string& dir, uint64_t number) {
 
 std::string ManifestFileName(const std::string& dir) { return dir + "/MANIFEST"; }
 
+std::string TempManifestFileName(const std::string& dir) { return dir + "/MANIFEST.tmp"; }
+
 FileType ParseFileName(const std::string& name, uint64_t* number) {
   if (name == "MANIFEST") return FileType::kManifest;
   if (name == "LOCK") return FileType::kLock;
+  if (name == "MANIFEST.tmp") return FileType::kTemp;
   size_t dot = name.find('.');
   if (dot == 0 || dot == std::string::npos) return FileType::kUnknown;
   for (size_t i = 0; i < dot; i++) {

@@ -122,19 +122,51 @@ Status Table::Get(std::string_view key, std::string* value, LookupResult* result
   return Status::OK();
 }
 
-Status Table::ForEach(const Visitor& fn) const {
-  std::string block;
-  for (const IndexEntry& ie : index_) {
-    Status s = ReadBlock(ie.offset, ie.size, &block);
-    if (!s.ok()) return s;
-    std::string_view in = block;
-    while (!in.empty()) {
-      Entry e;
-      if (!ParseEntry(&in, &e)) return Status::Corruption("bad data block in " + path_);
-      if (!fn(e.key, TagSequence(e.tag), TagType(e.tag), e.value)) return Status::OK();
+bool Table::Iterator::LoadBlock(size_t index) {
+  block_index_ = index;
+  if (index >= table_->index_.size()) return false;
+  const IndexEntry& ie = table_->index_[index];
+  status_ = table_->ReadBlock(ie.offset, ie.size, &block_);
+  if (!status_.ok()) return false;
+  rest_ = block_;
+  return true;
+}
+
+void Table::Iterator::ParseNextEntry() {
+  while (rest_.empty()) {
+    if (!LoadBlock(block_index_ + 1)) {
+      valid_ = false;
+      return;
     }
   }
-  return Status::OK();
+  Entry e;
+  if (!ParseEntry(&rest_, &e)) {
+    status_ = Status::Corruption("bad data block in " + table_->path_);
+    valid_ = false;
+    return;
+  }
+  key_ = e.key;
+  seq_ = TagSequence(e.tag);
+  type_ = TagType(e.tag);
+  value_ = e.value;
+  valid_ = true;
+}
+
+void Table::Iterator::SeekToFirst() {
+  status_ = Status::OK();
+  valid_ = false;
+  if (!LoadBlock(0)) return;
+  ParseNextEntry();
+}
+
+void Table::Iterator::Next() { ParseNextEntry(); }
+
+Status Table::ForEach(const Visitor& fn) const {
+  Iterator it(this);
+  for (it.SeekToFirst(); it.Valid(); it.Next()) {
+    if (!fn(it.key(), it.seq(), it.type(), it.value())) break;
+  }
+  return it.status();
 }
 
 }  // namespace ledgerkv
