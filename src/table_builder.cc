@@ -1,13 +1,9 @@
 #include "table_builder.h"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <cassert>
 
 #include "coding.h"
 #include "crc32c.h"
-#include "file_util.h"
 #include "table_format.h"
 
 namespace ledgerkv {
@@ -15,15 +11,7 @@ namespace ledgerkv {
 TableBuilder::TableBuilder(const Options& options, std::string path)
     : options_(options), path_(std::move(path)), bloom_(options.bloom_bits_per_key) {}
 
-TableBuilder::~TableBuilder() {
-  if (fd_ >= 0) ::close(fd_);
-}
-
-Status TableBuilder::Open() {
-  fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-  if (fd_ < 0) return IOErrorFromErrno("open " + path_);
-  return Status::OK();
-}
+Status TableBuilder::Open() { return options_.env->NewWritableFile(path_, &file_); }
 
 void TableBuilder::Add(std::string_view key, uint64_t seq, RecordType type, std::string_view value) {
   assert(num_entries_ == 0 || CompareInternal(key, seq, last_key_, last_seq_) > 0);
@@ -45,8 +33,8 @@ void TableBuilder::Add(std::string_view key, uint64_t seq, RecordType type, std:
 Status TableBuilder::WriteBlock(const std::string& contents, uint64_t* offset, uint64_t* size) {
   std::string trailer;
   PutFixed32(&trailer, crc32c::Value(contents.data(), contents.size()));
-  Status s = WriteAll(fd_, contents.data(), contents.size(), path_);
-  if (s.ok()) s = WriteAll(fd_, trailer.data(), trailer.size(), path_);
+  Status s = file_->Append(contents);
+  if (s.ok()) s = file_->Append(trailer);
   if (!s.ok()) return s;
   *offset = offset_;
   *size = contents.size();
@@ -82,20 +70,19 @@ Status TableBuilder::Finish() {
   PutFixed64(&footer, index_offset);
   PutFixed64(&footer, index_size);
   PutFixed64(&footer, kTableMagic);
-  s = WriteAll(fd_, footer.data(), footer.size(), path_);
+  s = file_->Append(footer);
   if (s.ok()) {
     offset_ += footer.size();
-    s = SyncFd(fd_, path_);
+    s = file_->Sync();
   }
-  if (s.ok() && ::close(fd_) != 0) s = IOErrorFromErrno("close " + path_);
-  fd_ = -1;
+  if (s.ok()) s = file_->Close();
+  file_.reset();
   return status_ = s;
 }
 
 void TableBuilder::Abandon() {
-  if (fd_ >= 0) ::close(fd_);
-  fd_ = -1;
-  ::unlink(path_.c_str());
+  file_.reset();
+  options_.env->RemoveFile(path_);  // Best effort; a leftover is an orphan, removed on the next open.
 }
 
 }  // namespace ledgerkv

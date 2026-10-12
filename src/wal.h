@@ -42,12 +42,14 @@ void EncodeWalRecord(const WalRecord& record, std::string* dst);
 
 class WalWriter {
  public:
-  static Status Open(const std::string& path, bool sync, std::unique_ptr<WalWriter>* out);
+  static Status Open(const std::string& path, bool sync, std::unique_ptr<WalWriter>* out,
+                     Env* env = Env::Default());
 
   Status Append(RecordType type, uint64_t seq, std::string_view key, std::string_view value);
   Status Append(const WalRecord& r) { return Append(r.type, r.seq, r.key, r.value); }
   // Appends pre-framed records in one write and at most one sync.
   Status AppendFramed(std::string_view framed) { return log_->AddFramedRecords(framed); }
+  Status Sync() { return log_->Sync(); }
 
  private:
   explicit WalWriter(std::unique_ptr<LogWriter> log) : log_(std::move(log)) {}
@@ -65,6 +67,6 @@ struct WalReadResult {
 // Reads every intact record from the start of the log. Missing files read as
 // empty. A torn or corrupt tail is reported through valid_bytes < file_bytes,
 // and the caller decides whether to truncate it.
-Status ReadWal(const std::string& path, WalReadResult* out);
+Status ReadWal(const std::string& path, WalReadResult* out, Env* env = Env::Default());
 
 }  // namespace ledgerkv

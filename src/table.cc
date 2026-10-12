@@ -1,15 +1,10 @@
 #include "table.h"
 
-#include <fcntl.h>
-#include <unistd.h>
-
 #include <algorithm>
-#include <cerrno>
 
 #include "bloom.h"
 #include "coding.h"
 #include "crc32c.h"
-#include "file_util.h"
 #include "table_format.h"
 
 namespace ledgerkv {
@@ -30,20 +25,10 @@ bool ParseEntry(std::string_view* in, Entry* e) {
 
 }  // namespace
 
-Table::~Table() { ::close(fd_); }
-
 Status Table::ReadBlock(uint64_t offset, uint64_t size, std::string* out) const {
-  out->resize(size + kBlockTrailerSize);
-  size_t done = 0;
-  while (done < out->size()) {
-    ssize_t r = ::pread(fd_, out->data() + done, out->size() - done, static_cast<off_t>(offset + done));
-    if (r < 0) {
-      if (errno == EINTR) continue;
-      return IOErrorFromErrno("pread " + path_);
-    }
-    if (r == 0) return Status::Corruption("truncated block in " + path_);
-    done += static_cast<size_t>(r);
-  }
+  Status s = file_->Read(offset, size + kBlockTrailerSize, out);
+  if (!s.ok()) return s;
+  if (out->size() != size + kBlockTrailerSize) return Status::Corruption("truncated block in " + path_);
   uint32_t expected = DecodeFixed32(out->data() + size);
   if (crc32c::Value(out->data(), size) != expected) {
     return Status::Corruption("block checksum mismatch in " + path_);
@@ -52,17 +37,17 @@ Status Table::ReadBlock(uint64_t offset, uint64_t size, std::string* out) const 
   return Status::OK();
 }
 
-Status Table::Open(const std::string& path, uint64_t file_size, std::shared_ptr<Table>* out) {
-  int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-  if (fd < 0) return IOErrorFromErrno("open " + path);
-  std::shared_ptr<Table> t(new Table(path, fd));
+Status Table::Open(const std::string& path, uint64_t file_size, std::shared_ptr<Table>* out, Env* env) {
+  std::unique_ptr<RandomAccessFile> file;
+  Status fs = env->NewRandomAccessFile(path, &file);
+  if (!fs.ok()) return fs;
+  std::shared_ptr<Table> t(new Table(path, std::move(file)));
   if (file_size < kFooterSize) return Status::Corruption("table too small: " + path);
 
-  std::string footer(kFooterSize, '\0');
-  if (::pread(fd, footer.data(), kFooterSize, static_cast<off_t>(file_size - kFooterSize)) !=
-      static_cast<ssize_t>(kFooterSize)) {
-    return Status::Corruption("cannot read footer of " + path);
-  }
+  std::string footer;
+  fs = t->file_->Read(file_size - kFooterSize, kFooterSize, &footer);
+  if (!fs.ok()) return fs;
+  if (footer.size() != kFooterSize) return Status::Corruption("cannot read footer of " + path);
   const char* f = footer.data();
   uint64_t filter_offset = DecodeFixed64(f), filter_size = DecodeFixed64(f + 8);
   uint64_t index_offset = DecodeFixed64(f + 16), index_size = DecodeFixed64(f + 24);

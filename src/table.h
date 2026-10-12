@@ -9,6 +9,7 @@
 
 #include "dbformat.h"
 #include "internal_iterator.h"
+#include "ledgerkv/env.h"
 #include "ledgerkv/status.h"
 
 namespace ledgerkv {
@@ -20,9 +21,9 @@ namespace ledgerkv {
 // Thread-safe: Get() and iterators may be used concurrently.
 class Table {
  public:
-  static Status Open(const std::string& path, uint64_t file_size, std::shared_ptr<Table>* out);
+  static Status Open(const std::string& path, uint64_t file_size, std::shared_ptr<Table>* out,
+                     Env* env = Env::Default());
 
-  ~Table();
   Table(const Table&) = delete;
   Table& operator=(const Table&) = delete;
 
@@ -76,12 +77,13 @@ class Table {
     uint64_t size;
   };
 
-  Table(std::string path, int fd) : path_(std::move(path)), fd_(fd) {}
+  Table(std::string path, std::unique_ptr<RandomAccessFile> file)
+      : path_(std::move(path)), file_(std::move(file)) {}
 
   Status ReadBlock(uint64_t offset, uint64_t size, std::string* out) const;
 
   const std::string path_;
-  const int fd_;
+  const std::unique_ptr<RandomAccessFile> file_;
   std::string filter_;
   std::vector<IndexEntry> index_;
 };

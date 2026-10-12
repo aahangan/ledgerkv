@@ -1,13 +1,7 @@
 #include "ledgerkv/db.h"
 
-#include <fcntl.h>
-#include <sys/file.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <atomic>
-#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -22,8 +16,8 @@
 #include <vector>
 
 #include "db_iter.h"
-#include "file_util.h"
 #include "filename.h"
+#include "ledgerkv/env.h"
 #include "log.h"
 #include "memtable.h"
 #include "merger.h"
@@ -105,7 +99,8 @@ struct Compaction {
 
 class DBImpl final : public DB {
  public:
-  DBImpl(Options options, std::string dir) : options_(options), dir_(std::move(dir)) {}
+  DBImpl(Options options, std::string dir)
+      : options_(options), env_(options.env ? options.env : Env::Default()), dir_(std::move(dir)) {}
   ~DBImpl() override;
 
   Status Init();
@@ -195,9 +190,18 @@ class DBImpl final : public DB {
   void RemoveObsoleteFiles(uint64_t min_log, const std::set<uint64_t>& live_tables,
                            bool set_aside_tables = false);
 
+  TableBuilder::Options TableOptions() const {
+    TableBuilder::Options topts;
+    topts.block_size = options_.block_size;
+    topts.bloom_bits_per_key = options_.bloom_bits_per_key;
+    topts.env = env_;
+    return topts;
+  }
+
   const Options options_;
+  Env* const env_;
   const std::string dir_;
-  int lock_fd_ = -1;
+  std::unique_ptr<FileLock> lock_;
   std::atomic<uint64_t> next_file_number_{1};
 
   // MANIFEST state, touched only by Init() and the background thread.
@@ -261,26 +265,17 @@ DBImpl::~DBImpl() {
   wal_.reset();
   manifest_.reset();
   current_.reset();
-  if (lock_fd_ >= 0) ::close(lock_fd_);  // Releases the flock last.
+  lock_.reset();  // Releases the lock last.
 }
 
-Status DBImpl::AcquireLock() {
-  std::string path = dir_ + "/LOCK";
-  lock_fd_ = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-  if (lock_fd_ < 0) return IOErrorFromErrno("open " + path);
-  if (::flock(lock_fd_, LOCK_EX | LOCK_NB) != 0) {
-    return IOErrorFromErrno("lock " + path + " (is another process using this database?)");
-  }
-  return Status::OK();
-}
+Status DBImpl::AcquireLock() { return env_->LockFile(dir_ + "/LOCK", &lock_); }
 
 Status DBImpl::Init() {
-  if (::mkdir(dir_.c_str(), 0755) != 0) {
-    if (errno != EEXIST) return IOErrorFromErrno("mkdir " + dir_);
-  } else if (!options_.create_if_missing) {
-    return Status::InvalidArgument(dir_ + " does not exist");
-  }
-  Status s = AcquireLock();
+  bool created = false;
+  Status s = env_->CreateDirIfMissing(dir_, &created);
+  if (!s.ok()) return s;
+  if (created && !options_.create_if_missing) return Status::InvalidArgument(dir_ + " does not exist");
+  s = AcquireLock();
   if (!s.ok()) return s;
 
   // 1. Rebuild the set of live tables by replaying the MANIFEST.
@@ -304,7 +299,7 @@ Status DBImpl::Init() {
         for (const TableMeta& t : e.added_tables) tables[t.number] = t;
         return true;
       },
-      &mstats);
+      &mstats, env_);
   if (!s.ok()) return s;
   // A record that passed its checksum but does not parse is real corruption,
   // not a torn write. Refuse to guess which tables are live.
@@ -317,7 +312,7 @@ Status DBImpl::Init() {
 
   // 2. Find the logs that may hold writes not yet in any table.
   std::vector<std::string> names;
-  s = ListDir(dir_, &names);
+  s = env_->GetChildren(dir_, &names);
   if (!s.ok()) return s;
   std::vector<uint64_t> logs;
   uint64_t max_number = 0;
@@ -337,11 +332,11 @@ Status DBImpl::Init() {
   for (uint64_t number : logs) {
     std::string path = LogFileName(dir_, number);
     WalReadResult log;
-    s = ReadWal(path, &log);
+    s = ReadWal(path, &log, env_);
     if (!s.ok()) return s;
     if (log.valid_bytes < log.file_bytes) {
       // Drop a torn tail. Otherwise later appends would sit behind garbage.
-      s = TruncateFile(path, log.valid_bytes);
+      s = env_->TruncateFile(path, log.valid_bytes);
       if (!s.ok()) return s;
     }
     for (const WalRecord& r : log.records) {
@@ -360,7 +355,7 @@ Status DBImpl::Init() {
   std::map<uint64_t, std::shared_ptr<Table>> open_tables;
   VersionEdit edit;
   for (const auto& [number, meta] : tables) {
-    s = Table::Open(TableFileName(dir_, number), meta.file_size, &open_tables[number]);
+    s = Table::Open(TableFileName(dir_, number), meta.file_size, &open_tables[number], env_);
     if (!s.ok()) return s;
     edit.added_tables.push_back(meta);
   }
@@ -368,7 +363,9 @@ Status DBImpl::Init() {
     TableMeta meta;
     uint64_t dropped = 0;
     s = WriteTable(recovered, max_seq, &meta, &dropped);  // No snapshots exist yet.
-    if (s.ok()) s = Table::Open(TableFileName(dir_, meta.number), meta.file_size, &open_tables[meta.number]);
+    if (s.ok()) {
+      s = Table::Open(TableFileName(dir_, meta.number), meta.file_size, &open_tables[meta.number], env_);
+    }
     if (!s.ok()) return s;
     edit.added_tables.push_back(meta);
   }
@@ -377,7 +374,7 @@ Status DBImpl::Init() {
   // 5. Start a fresh log and commit the new state as a MANIFEST snapshot,
   // which also compacts away the edit history.
   uint64_t new_log = next_file_number_++;
-  s = WalWriter::Open(LogFileName(dir_, new_log), options_.sync, &wal_);
+  s = WalWriter::Open(LogFileName(dir_, new_log), options_.sync, &wal_, env_);
   if (!s.ok()) return s;
   committed_log_number_ = new_log;
   committed_last_seq_ = max_seq;
@@ -395,10 +392,7 @@ Status DBImpl::WriteTable(const MemTable& mem, uint64_t smallest_snapshot, Table
   meta->level = 0;
   meta->number = next_file_number_++;
   std::string path = TableFileName(dir_, meta->number);
-  TableBuilder::Options topts;
-  topts.block_size = options_.block_size;
-  topts.bloom_bits_per_key = options_.bloom_bits_per_key;
-  TableBuilder builder(topts, path);
+  TableBuilder builder(TableOptions(), path);
   Status s = builder.Open();
   if (s.ok()) {
     ShadowFilter filter(smallest_snapshot);
@@ -420,7 +414,7 @@ Status DBImpl::WriteTable(const MemTable& mem, uint64_t smallest_snapshot, Table
   meta->smallest = builder.SmallestKey();
   meta->largest = builder.LargestKey();
   // The table's directory entry must be durable before the MANIFEST names it.
-  return SyncDir(dir_);
+  return env_->SyncDir(dir_);
 }
 
 Status DBImpl::LogAndApply(VersionEdit* edit, const Version& v) {
@@ -448,39 +442,40 @@ Status DBImpl::WriteManifestSnapshot(const Version& v) {
   snapshot.EncodeTo(&record);
 
   const std::string tmp = TempManifestFileName(dir_);
-  ::unlink(tmp.c_str());
+  if (env_->FileExists(tmp)) env_->RemoveFile(tmp);
   {
     std::unique_ptr<LogWriter> w;
-    Status s = LogWriter::Open(tmp, /*sync=*/true, &w);
+    Status s = LogWriter::Open(tmp, /*sync=*/true, &w, env_);
     if (s.ok()) s = w->AddRecord(record);
     if (!s.ok()) return s;
   }
   const std::string path = ManifestFileName(dir_);
-  if (::rename(tmp.c_str(), path.c_str()) != 0) return IOErrorFromErrno("rename " + tmp);
-  Status s = SyncDir(dir_);
+  Status s = env_->RenameFile(tmp, path);
+  if (s.ok()) s = env_->SyncDir(dir_);
   if (!s.ok()) return s;
   manifest_.reset();
   manifest_bytes_ = kLogHeaderSize + record.size();
-  return LogWriter::Open(path, /*sync=*/true, &manifest_);
+  return LogWriter::Open(path, /*sync=*/true, &manifest_, env_);
 }
 
 void DBImpl::RemoveObsoleteFiles(uint64_t min_log, const std::set<uint64_t>& live_tables,
                                  bool set_aside_tables) {
   std::vector<std::string> names;
-  if (!ListDir(dir_, &names).ok()) return;  // Best effort: leftovers are retried next time.
+  if (!env_->GetChildren(dir_, &names).ok()) return;  // Best effort: leftovers are retried next time.
   for (const std::string& name : names) {
     uint64_t number = 0;
     FileType type = ParseFileName(name, &number);
     std::string path = dir_ + "/" + name;
     if ((type == FileType::kLog && number < min_log) || type == FileType::kTemp) {
-      ::unlink(path.c_str());
+      env_->RemoveFile(path);
     } else if (type == FileType::kTable && live_tables.count(number) == 0 &&
                pending_outputs_.count(number) == 0) {
       if (set_aside_tables) {
-        ::mkdir((dir_ + "/lost").c_str(), 0755);
-        ::rename(path.c_str(), (dir_ + "/lost/" + name).c_str());
+        bool created;
+        env_->CreateDirIfMissing(dir_ + "/lost", &created);
+        env_->RenameFile(path, dir_ + "/lost/" + name);
       } else {
-        ::unlink(path.c_str());
+        env_->RemoveFile(path);
       }
     }
   }
@@ -592,7 +587,7 @@ Status DBImpl::FlushImmutable() {
   uint64_t versions_dropped = 0;
   std::map<uint64_t, std::shared_ptr<Table>> tables;
   Status s = WriteTable(*imm, SmallestSnapshot(), &meta, &versions_dropped);
-  if (s.ok()) s = Table::Open(TableFileName(dir_, meta.number), meta.file_size, &tables[meta.number]);
+  if (s.ok()) s = Table::Open(TableFileName(dir_, meta.number), meta.file_size, &tables[meta.number], env_);
   if (!s.ok()) return s;
 
   VersionEdit edit;
@@ -650,9 +645,7 @@ Status DBImpl::DoCompaction(const Compaction& c) {
   }
   auto input = NewMergingIterator(std::move(children));
 
-  TableBuilder::Options topts;
-  topts.block_size = options_.block_size;
-  topts.bloom_bits_per_key = options_.bloom_bits_per_key;
+  const TableBuilder::Options topts = TableOptions();
   std::unique_ptr<TableBuilder> builder;
   TableMeta out;
   std::vector<TableMeta> outputs;
@@ -738,10 +731,10 @@ Status DBImpl::DoCompaction(const Compaction& c) {
 
   // Same crash ordering as a flush: outputs durable, then the MANIFEST edit
   // swaps inputs for outputs atomically, then inputs are deleted.
-  s = SyncDir(dir_);
+  s = env_->SyncDir(dir_);
   uint64_t bytes_written = 0;
   for (const TableMeta& m : outputs) {
-    if (s.ok()) s = Table::Open(TableFileName(dir_, m.number), m.file_size, &tables[m.number]);
+    if (s.ok()) s = Table::Open(TableFileName(dir_, m.number), m.file_size, &tables[m.number], env_);
     edit.added_tables.push_back(m);
     bytes_written += m.file_size;
   }
@@ -854,10 +847,28 @@ Status DBImpl::MakeRoomForWrite(std::unique_lock<std::mutex>& lock, bool force) 
       continue;
     }
 
+    // With sync off, the log being retired may still have unsynced data.
+    // Sync it before any write goes to the next log. Otherwise a power cut
+    // could keep the newer log's writes while tearing off the older log's
+    // tail, and recovery would replay a state with a hole in the middle
+    // rather than a prefix of the writes. (Found by the power-loss test.)
+    // This costs one fsync per memtable, not per write. Only the write
+    // leader touches wal_, and nothing else can freeze the memtable, so the
+    // lock can be dropped while the disk works.
+    Status s;
+    if (!options_.sync) {
+      lock.unlock();
+      s = wal_->Sync();
+      lock.lock();
+    }
+    if (!s.ok()) {
+      write_error_ = s;
+      return s;
+    }
     uint64_t number = next_file_number_++;
     std::unique_ptr<WalWriter> wal;
-    Status s = WalWriter::Open(LogFileName(dir_, number), options_.sync, &wal);
-    if (s.ok() && options_.sync) s = SyncDir(dir_);
+    s = WalWriter::Open(LogFileName(dir_, number), options_.sync, &wal, env_);
+    if (s.ok() && options_.sync) s = env_->SyncDir(dir_);
     if (!s.ok()) return s;
     wal_ = std::move(wal);
     imm_ = mem_;

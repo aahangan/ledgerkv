@@ -51,9 +51,9 @@ void EncodeWalRecord(const WalRecord& r, std::string* dst) {
   AppendLogRecord(payload, dst);
 }
 
-Status WalWriter::Open(const std::string& path, bool sync, std::unique_ptr<WalWriter>* out) {
+Status WalWriter::Open(const std::string& path, bool sync, std::unique_ptr<WalWriter>* out, Env* env) {
   std::unique_ptr<LogWriter> log;
-  Status s = LogWriter::Open(path, sync, &log);
+  Status s = LogWriter::Open(path, sync, &log, env);
   if (!s.ok()) return s;
   out->reset(new WalWriter(std::move(log)));
   return Status::OK();
@@ -65,13 +65,12 @@ Status WalWriter::Append(RecordType type, uint64_t seq, std::string_view key, st
   return log_->AddRecord(scratch_);
 }
 
-Status ReadWal(const std::string& path, WalReadResult* out) {
+Status ReadWal(const std::string& path, WalReadResult* out, Env* env) {
   *out = WalReadResult();
   LogReadStats stats;
   Status s = ReadLog(
       path,
-      [&](std::string_view payload) { return DecodeWalPayload(payload, &out->records); },
-      &stats);
+      [&](std::string_view payload) { return DecodeWalPayload(payload, &out->records); }, &stats, env);
   out->valid_bytes = stats.valid_bytes;
   out->file_bytes = stats.file_bytes;
   return s;

@@ -24,3 +24,37 @@ jobs:
         run: ./build/crash_test --iterations 100
       - name: Crash test, 8 concurrent writers
         run: ./build/crash_test --iterations 50 --threads 8
+      - name: Power loss, sync on
+        run: ./build/powerloss_test --iterations 100 --sync
+      - name: Power loss, sync off
+        run: ./build/powerloss_test --iterations 100
+      - name: Power loss with injected I/O errors
+        run: ./build/powerloss_test --iterations 100 --sync --faults
+      - name: Fuzz (random mutation driver)
+        run: for t in log write_batch table db; do ./build/fuzz_$t --iterations 20000; done
+
+  # Coverage-guided fuzzing with libFuzzer, which Apple clang does not ship.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build seed corpus
+        run: |
+          cmake -S . -B build-seeds
+          cmake --build build-seeds -j --target fuzz_seeds
+          ./build-seeds/fuzz_seeds corpus
+      - name: Build fuzz targets
+        run: |
+          cmake -S . -B build -DCMAKE_CXX_COMPILER=clang++ -DLEDGERKV_FUZZ=ON -DLEDGERKV_SANITIZE=address
+          cmake --build build -j --target fuzz_log fuzz_write_batch fuzz_table fuzz_db
+      - name: Fuzz for 60 seconds per target
+        run: |
+          for t in log write_batch table db; do
+            ./build/fuzz_$t corpus/$t -max_total_time=60 -timeout=10 -print_final_stats=1
+          done
+      - name: Keep crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: crash-*

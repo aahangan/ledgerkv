@@ -4,7 +4,12 @@
 
 namespace ledgerkv {
 
+class Env;
+
 struct Options {
+  // Filesystem access. Null means Env::Default() (POSIX). Not owned.
+  Env* env = nullptr;
+
   // Create the database directory if it does not exist.
   bool create_if_missing = true;
 

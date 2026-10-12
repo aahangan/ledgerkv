@@ -6,6 +6,7 @@
 
 #include "bloom.h"
 #include "dbformat.h"
+#include "ledgerkv/env.h"
 #include "ledgerkv/status.h"
 
 namespace ledgerkv {
@@ -20,10 +21,10 @@ class TableBuilder {
   struct Options {
     size_t block_size = 4096;
     int bloom_bits_per_key = 10;
+    Env* env = Env::Default();
   };
 
   TableBuilder(const Options& options, std::string path);
-  ~TableBuilder();
   TableBuilder(const TableBuilder&) = delete;
   TableBuilder& operator=(const TableBuilder&) = delete;
 
@@ -48,7 +49,7 @@ class TableBuilder {
 
   const Options options_;
   const std::string path_;
-  int fd_ = -1;
+  std::unique_ptr<WritableFile> file_;
   Status status_;
 
   uint64_t offset_ = 0;

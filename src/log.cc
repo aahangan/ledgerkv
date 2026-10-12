@@ -1,14 +1,7 @@
 #include "log.h"
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
-#include <cerrno>
-
 #include "coding.h"
 #include "crc32c.h"
-#include "file_util.h"
 
 namespace ledgerkv {
 
@@ -21,42 +14,39 @@ void AppendLogRecord(std::string_view payload, std::string* dst) {
   dst->append(payload);
 }
 
-Status LogWriter::Open(const std::string& path, bool sync, std::unique_ptr<LogWriter>* out) {
-  int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
-  if (fd < 0) return IOErrorFromErrno("open " + path);
-  out->reset(new LogWriter(path, fd, sync));
+Status LogWriter::Open(const std::string& path, bool sync, std::unique_ptr<LogWriter>* out, Env* env) {
+  std::unique_ptr<WritableFile> file;
+  Status s = env->NewAppendableFile(path, &file);
+  if (!s.ok()) return s;
+  out->reset(new LogWriter(std::move(file), sync));
   return Status::OK();
 }
-
-LogWriter::~LogWriter() { ::close(fd_); }
 
 Status LogWriter::AddRecord(std::string_view payload) {
   scratch_.clear();
   AppendLogRecord(payload, &scratch_);
-  Status s = WriteAll(fd_, scratch_.data(), scratch_.size(), path_);
-  if (s.ok() && sync_) s = SyncFd(fd_, path_);
-  return s;
+  return AddFramedRecords(scratch_);
 }
 
 Status LogWriter::AddFramedRecords(std::string_view framed) {
-  Status s = WriteAll(fd_, framed.data(), framed.size(), path_);
-  if (s.ok() && sync_) s = SyncFd(fd_, path_);
+  Status s = file_->Append(framed);
+  if (s.ok() && sync_) s = file_->Sync();
   return s;
 }
 
 Status ReadLog(const std::string& path, const std::function<bool(std::string_view)>& fn,
-               LogReadStats* stats) {
+               LogReadStats* stats, Env* env) {
   *stats = LogReadStats();
-  struct stat st;
-  if (::stat(path.c_str(), &st) != 0) {
-    if (errno == ENOENT) return Status::OK();
-    return IOErrorFromErrno("stat " + path);
-  }
+  if (!env->FileExists(path)) return Status::OK();
   std::string data;
-  Status s = ReadFileToString(path, &data);
+  Status s = env->ReadFileToString(path, &data);
   if (!s.ok()) return s;
   stats->file_bytes = data.size();
+  stats->valid_bytes = ParseLogRecords(data, fn);
+  return Status::OK();
+}
 
+uint64_t ParseLogRecords(std::string_view data, const std::function<bool(std::string_view)>& fn) {
   size_t pos = 0;
   while (data.size() - pos >= kLogHeaderSize) {
     const char* header = data.data() + pos;
@@ -67,8 +57,7 @@ Status ReadLog(const std::string& path, const std::function<bool(std::string_vie
     if (!fn(std::string_view(header + kLogHeaderSize, len))) break;
     pos += kLogHeaderSize + len;
   }
-  stats->valid_bytes = pos;
-  return Status::OK();
+  return pos;
 }
 
 }  // namespace ledgerkv

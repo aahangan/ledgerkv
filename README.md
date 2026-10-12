@@ -6,7 +6,9 @@ skiplist memtable, sorted on-disk tables with bloom filters, leveled
 compaction, snapshots, and iterators.
 
 The goal is correctness you can check, not peak speed. Each durability claim
-here is backed by a test that tries to break it.
+here is backed by a test that tries to break it: process kills, simulated
+power loss with torn writes, injected I/O errors, and fuzzing. Each test has
+been shown to catch real bugs, by planting them on purpose.
 
 ## Status
 
@@ -16,7 +18,7 @@ here is backed by a test that tries to break it.
 | 2. SSTables | Background flush to immutable sorted tables, block index, bloom filters, MANIFEST, bounded WAL | **done** |
 | 3. Compaction | Leveled compaction, tombstone GC, write throttling, MANIFEST snapshots | **done** |
 | 4. Concurrency | Group commit, atomic batches, lock-free skiplist memtable, snapshots, iterators | **done** |
-| 5. Hardening | Power-loss simulation (drop unsynced writes), fsync-failure injection, fuzzing | next |
+| 5. Hardening | Pluggable `Env`, power-loss simulation with torn writes, I/O error injection, fuzzing | **done** |
 
 ## API
 
@@ -61,10 +63,18 @@ db->GetStats();    // Per-level sizes, amplification inputs, group commit sizes
 
 ```sh
 cmake -S . -B build && cmake --build build -j
-./build/ledgerkv_tests              # unit tests
-./build/crash_test --iterations 200
-./build/kvbench --num 1000000    # add --sync to fsync every write
+./build/ledgerkv_tests                               # unit tests
+./build/crash_test --iterations 200 --threads 8      # SIGKILL mid-write
+./build/powerloss_test --iterations 200 --sync       # simulated power cuts
+./build/powerloss_test --iterations 200 --sync --faults   # ...plus I/O errors
+./build/fuzz_db --iterations 50000                   # also fuzz_log, fuzz_write_batch, fuzz_table
+./build/kvbench --num 1000000                        # add --sync to fsync every write
 ```
+
+For coverage-guided fuzzing, build with a clang that ships libFuzzer:
+`cmake -S . -B build-fuzz -DCMAKE_CXX_COMPILER=clang++ -DLEDGERKV_FUZZ=ON
+-DLEDGERKV_SANITIZE=address`, then `./build/fuzz_seeds corpus` (from a normal
+build) and `./build-fuzz/fuzz_db corpus/db`.
 
 Sanitizer builds: `cmake -S . -B build-asan -DLEDGERKV_SANITIZE=address` (also
 `thread`, `undefined`).
@@ -282,16 +292,58 @@ apart from a torn append, so that edit is dropped. Recovery then moves the
 tables the MANIFEST does not mention into `lost/` instead of deleting them, so
 the data is still on disk and can be recovered by hand, but it is not served.
 
+### Durability guarantees
+
+These are the guarantees, stated precisely. Each one is tested by the
+power-loss harness described below.
+
+- **`sync = true`:** a write is durable before `Put`/`Write` returns. After a
+  crash or power loss, every acknowledged write is present.
+- **`sync = false`:** recent acknowledged writes can be lost after power loss
+  (a process crash alone loses nothing). But the recovered database is always
+  exactly the state after some prefix of the writes: no holes, no reordering.
+  At most about one memtable's worth of writes is lost.
+- **Either way:** batches are all-or-nothing, and a read never returns a
+  value that was not written.
+
+Getting the `sync = false` guarantee right took a fix found by testing.
+Without per-write syncs, a power cut could keep the newer log's writes while
+tearing off the older log's unsynced tail, and recovery would replay a state
+with a hole in the middle. Now the retiring log is synced once whenever the
+memtable is switched. That costs one fsync per 4 MB of writes, not one per
+write.
+
+**I/O errors.** A failed WAL append or fsync is reported to the writer and
+makes the database refuse all later writes until it is reopened. Retrying
+fsync after a failure is not safe: Linux may have already dropped the dirty
+pages and will report the retry as a success (the 2018 "fsyncgate" issue in
+PostgreSQL). A short write also leaves a partial record that later records
+must not follow. A failed background flush or compaction is sticky in the
+same way. Its inputs stay live, so nothing is lost. Read errors surface as
+`IOError`, never as a wrong value or a false `NotFound`.
+
 ### Durability on macOS
 
 `fsync()` on macOS does not flush the drive's write cache, so with
 `sync = true` ledgerkv uses `fcntl(F_FULLFSYNC)`. That is the main reason synced
 writes cost about 4 ms each on a laptop SSD (see the benchmarks below).
 
+### Pluggable Env
+
+Every filesystem call (open, append, sync, read, rename, remove, directory
+sync, lock) goes through an `Env` interface. The default is POSIX.
+`Options::env` can substitute another, which is how the tests inject faults.
+The `Env` contract is the durability model the engine is written against:
+
+- appended data survives power loss only after the file is synced, and
+- a created, renamed, or deleted file's directory entry survives only after
+  its directory is synced.
+
 ## Testing
 
-40 unit tests, plus a crash harness. CI runs everything on Linux and macOS
-under AddressSanitizer, ThreadSanitizer, and UBSan.
+51 unit tests, a process-crash harness, a power-loss harness, and four fuzz
+targets. CI runs everything on Linux and macOS under AddressSanitizer,
+ThreadSanitizer, and UBSan, plus coverage-guided libFuzzer on Linux.
 
 **Torn and corrupted writes.** The WAL tests truncate the log at every byte
 offset inside the final record and flip every single bit in the log.
@@ -349,9 +401,77 @@ To check that the tests can catch real bugs, I injected these:
 | Drop tombstones in every compaction, not only at the bottom | model test, tombstone test | Deleted keys came back |
 | Group commit acknowledges followers before their records reach the WAL | crash test, 8 writers | Acknowledged writes lost |
 | Compaction ignores live snapshots when dropping old versions | snapshot test | Snapshot read returned the new value |
+| Skip the directory fsync after writing a table, before the MANIFEST names it | power-loss test | After the power cut the MANIFEST named a table that no longer existed |
+| A failed WAL append is not sticky, so later writes go ahead | power-loss test (faults), unit tests | Writes accepted after a WAL failure |
+| No sync of the retiring log at memtable switch (the original code, not a planted bug) | power-loss test, `sync = false` | Recovered state had a hole: not a prefix of the writes |
+| Remove the bounds check from the length-prefixed field decoder | `fuzz_log`, `fuzz_write_batch`, `fuzz_table` | Heap buffer overflow, caught by ASan within seconds |
+| Compaction drops a version that is one sequence number too new for the oldest snapshot | `fuzz_db` | A snapshot read returned NotFound for a key it should see (94-byte input) |
 
-What `SIGKILL` does not cover: power loss, where unsynced data in the page
-cache is lost. That is milestone 5.
+Two more findings came from checking the checks themselves. At first the
+power-loss harness confirmed "writes are refused after a WAL failure" while
+the injected fault was still armed, so the follow-up write failed on the
+fault and proved nothing. The non-sticky bug above slipped through until the
+harness was changed to clear the fault before retrying. And `fuzz_table`
+missed the decoder overflow until its checksum-repairing mode was added.
+
+
+
+`SIGKILL` cannot simulate power loss, because the page cache survives a
+process crash. The power-loss harness covers that.
+
+**Power loss** (`tools/powerloss_test.cc`, `src/fault_env.cc`). A
+`FaultInjectionEnv` wraps the real filesystem and keeps a durability ledger:
+for every file, how much was appended and how much was synced, and whether
+its directory entry was synced; plus every rename and removal not yet made
+durable by a directory sync (removed files are parked, not deleted). To cut
+the power, the harness freezes the disk mid-workload, tears the database
+down, and rewinds the disk to what a real one could hold:
+
+- each file is cut back to its synced length, often keeping a random torn
+  piece of the unsynced tail, sometimes followed by garbage,
+- files whose directory entry was never synced disappear, and
+- unsynced renames and removals are undone (the MANIFEST snapshot rename
+  included).
+
+After reopening, the recovered state must equal the model after some prefix
+of the writes, and with `sync = true` that prefix must include every
+acknowledged write. The harness finds the matching prefix with a running
+mismatch count, updated in O(1) per operation, since each operation changes
+one key. Interrupted flushes and compactions are part of every run.
+
+With `--faults`, each power cut also comes with an injected I/O error: a
+failed WAL fsync, a short WAL write, a failed table fsync, short write, or
+create, a failed MANIFEST fsync, a failed MANIFEST rename during open, or a
+failed directory fsync. The error must reach the caller. After a WAL failure,
+writes must still be refused even once the disk "recovers". And the prefix
+rule must still hold afterwards.
+
+| Mode | Power cuts | Operations | Result |
+|---|---|---|---|
+| `sync = true` | 200 | 1.49M | every acknowledged write survived |
+| `sync = false` | 600 (3 seeds) | 4.6M | every recovery an exact prefix; unsynced tail lost averaged 220–250 ops, max 566 |
+| `sync = true` + I/O errors | 300 | 1.47M | 170 injected errors (all 8 kinds), none lost an acknowledged write |
+
+Unit tests pin down the specific cases: a WAL fsync failure is sticky and
+loses nothing acknowledged; a short WAL write does not strand later writes;
+failed flushes and MANIFEST commits stop writes and keep the data; and with
+30% of table reads failing, 1,461 of 5,000 reads returned `IOError` and none
+returned a wrong value.
+
+**Fuzzing** (`fuzz/`). Four targets:
+
+| Target | What it feeds | Checks |
+|---|---|---|
+| `fuzz_log` | WAL and MANIFEST bytes | framing, WAL payloads, and version edits never crash; decoded records survive an encode/decode round trip |
+| `fuzz_write_batch` | batch encodings | decode, rebuild through the public API, decode again: same operations |
+| `fuzz_table` | table files | open, scan, and lookups return data or `Corruption`, never crash. Half the inputs are wrapped in a well-formed, correctly checksummed file, so fuzzed bytes reach the block parsers instead of bouncing off the checksums. |
+| `fuzz_db` | operation sequences | differential test against a `std::map`: puts, deletes, batches, flushes, full compactions, snapshots checked later, scans, seeks, reopens; every read must match, and `Verify()` must pass |
+
+In CI they run under libFuzzer (coverage-guided, 60 s each) on Linux. Apple's
+clang does not ship libFuzzer, so the same targets also link against a small
+random-mutation driver that works with any compiler. Locally, each target ran
+200,000 mutated inputs (20,000 for `fuzz_db`) under ASan and UBSan with no
+failures.
 
 ## Benchmarks
 
@@ -428,6 +548,9 @@ What these numbers say:
   the level two below (as LevelDB does), would be the next steps.
 - **readrandom p99 at 10M is disk-bound.** ~10 GB of compaction writes churn
   the page cache, so the tail includes SSD reads. There is no block cache yet.
+- **The hardening layer cost nothing measurable.** Routing all I/O through a
+  virtual `Env`, and syncing the retiring log at each memtable switch, left
+  every benchmark within normal run-to-run variance.
 - **Multi-version storage cost little.** Moving from a `std::map` that kept
   one version per key to a skiplist that keeps every version left
   single-threaded throughput about where it was in milestone 3.

@@ -41,54 +41,12 @@
 #include <vector>
 
 #include "ledgerkv/db.h"
+#include "workload.h"
 
 using namespace ledgerkv;
+using namespace ledgerkv::workload;
 
 namespace {
-
-uint64_t Mix(uint64_t x) {  // splitmix64
-  x += 0x9E3779B97F4A7C15ULL;
-  x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-  x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-  return x ^ (x >> 31);
-}
-
-// Per thread, operation n is:
-//   n % 10 == 9: delete of key n - 5
-//   n % 10 == 7: batch putting key n and its mirror key, both to Value(n)
-//   otherwise:   put of key n
-bool IsDelete(uint64_t n) { return n % 10 == 9; }
-bool IsBatch(uint64_t n) { return n % 10 == 7; }
-uint64_t TargetKey(uint64_t n) { return IsDelete(n) ? n - 5 : n; }
-
-// A batch's mirror key sorts right after its main key. Keeping them adjacent
-// matters: if mirrors lived in a separate key range, every small table would
-// span the whole key space, every level-0 compaction would rewrite all of
-// level 1, and compactions would rarely finish between kills.
-std::string Key(int thread, uint64_t n, bool mirror = false) {
-  char buf[48];
-  std::snprintf(buf, sizeof(buf), "t%02d-key%012llu%s", thread, static_cast<unsigned long long>(n),
-                mirror ? "~mirror" : "");
-  return buf;
-}
-
-std::string Value(int thread, uint64_t n) {
-  uint64_t h = Mix(n * 131 + static_cast<uint64_t>(thread));
-  std::string v(1 + h % 128, '\0');
-  for (size_t i = 0; i < v.size(); i++) v[i] = static_cast<char>('a' + (Mix(h + i) % 26));
-  return v;
-}
-
-Status Apply(DB* db, int thread, uint64_t n) {
-  if (IsDelete(n)) return db->Delete(Key(thread, TargetKey(n)));
-  if (IsBatch(n)) {
-    WriteBatch b;
-    b.Put(Key(thread, n), Value(thread, n));
-    b.Put(Key(thread, n, /*mirror=*/true), Value(thread, n));
-    return db->Write(b);
-  }
-  return db->Put(Key(thread, n), Value(thread, n));
-}
 
 struct Ack {
   uint64_t thread;
@@ -121,12 +79,6 @@ struct Ack {
   }
   for (auto& th : threads) th.join();
   _exit(5);  // Unreachable: the writers run until killed.
-}
-
-// Expected state of a thread's key k after its operations [1, last] applied.
-bool ExpectPresent(uint64_t k, uint64_t last) {
-  if (k > last || IsDelete(k)) return false;
-  return !(k % 10 == 4 && k + 5 <= last);
 }
 
 int failures = 0;
