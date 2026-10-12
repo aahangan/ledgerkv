@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "file_util.h"
+#include "filename.h"
 #include "testing.h"
 
 using namespace ledgerkv;
@@ -75,7 +76,14 @@ TEST(DBWritesAfterTornTailSurvive) {
     CHECK_OK(db->Put("a", "1"));
     CHECK_OK(db->Put("b", "2"));
   }
-  std::string wal = dir + "/wal.log";
+  std::string wal;
+  std::vector<std::string> names;
+  CHECK_OK(ListDir(dir, &names));
+  for (const auto& name : names) {
+    uint64_t number;
+    if (ParseFileName(name, &number) == FileType::kLog) wal = dir + "/" + name;
+  }
+  CHECK(!wal.empty());
   std::string data;
   CHECK_OK(ReadFileToString(wal, &data));
   CHECK_EQ(::truncate(wal.c_str(), static_cast<off_t>(data.size() - 3)), 0);

@@ -1,5 +1,6 @@
 #include "file_util.h"
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -60,6 +61,35 @@ Status ReadFileToString(const std::string& path, std::string* out) {
   }
   ::close(fd);
   return Status::OK();
+}
+
+}  // namespace ledgerkv
+
+namespace ledgerkv {
+
+Status ListDir(const std::string& dir, std::vector<std::string>* names) {
+  names->clear();
+  DIR* d = ::opendir(dir.c_str());
+  if (d == nullptr) return IOErrorFromErrno("opendir " + dir);
+  while (struct dirent* e = ::readdir(d)) {
+    std::string name = e->d_name;
+    if (name != "." && name != "..") names->push_back(std::move(name));
+  }
+  ::closedir(d);
+  return Status::OK();
+}
+
+Status TruncateFile(const std::string& path, uint64_t size) {
+  int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+  if (fd < 0) return IOErrorFromErrno("open " + path);
+  Status s;
+  if (::ftruncate(fd, static_cast<off_t>(size)) != 0) {
+    s = IOErrorFromErrno("truncate " + path);
+  } else {
+    s = SyncFd(fd, path);
+  }
+  ::close(fd);
+  return s;
 }
 
 }  // namespace ledgerkv

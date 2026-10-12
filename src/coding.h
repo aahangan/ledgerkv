@@ -70,3 +70,29 @@ inline uint64_t DecodeFixed64(const char* p) {
 }
 
 }  // namespace ledgerkv
+
+namespace ledgerkv {
+
+inline void PutVarint64(std::string* dst, uint64_t v) {
+  while (v >= 0x80) {
+    dst->push_back(static_cast<char>((v & 0x7F) | 0x80));
+    v >>= 7;
+  }
+  dst->push_back(static_cast<char>(v));
+}
+
+inline bool GetVarint64(std::string_view* in, uint64_t* v) {
+  uint64_t result = 0;
+  for (int shift = 0; shift <= 63 && !in->empty(); shift += 7) {
+    auto byte = static_cast<uint8_t>(in->front());
+    in->remove_prefix(1);
+    result |= static_cast<uint64_t>(byte & 0x7F) << shift;
+    if (!(byte & 0x80)) {
+      *v = result;
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace ledgerkv

@@ -18,16 +18,23 @@ if(LEDGERKV_SANITIZE)
 endif()
 
 add_library(ledgerkv
+  src/bloom.cc
   src/crc32c.cc
-  src/file_util.cc
   src/db.cc
+  src/file_util.cc
+  src/filename.cc
+  src/log.cc
   src/memtable.cc
   src/status.cc
+  src/table.cc
+  src/table_builder.cc
+  src/version_edit.cc
   src/wal.cc
 )
 target_include_directories(ledgerkv PUBLIC include PRIVATE src)
 
-add_executable(ledgerkv_tests tests/test_main.cc tests/wal_test.cc tests/db_test.cc)
+add_executable(ledgerkv_tests tests/test_main.cc tests/wal_test.cc tests/db_test.cc
+  tests/table_test.cc tests/recovery_test.cc)
 target_link_libraries(ledgerkv_tests PRIVATE ledgerkv)
 target_include_directories(ledgerkv_tests PRIVATE src tests)
 
