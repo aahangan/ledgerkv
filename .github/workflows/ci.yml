@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        sanitize: ["", address, thread, undefined]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S . -B build -DLEDGERKV_SANITIZE=${{ matrix.sanitize }}
+      - name: Build
+        run: cmake --build build -j
+      - name: Unit tests
+        run: ./build/ledgerkv_tests
+      - name: Crash test
+        run: ./build/crash_test --iterations 100
