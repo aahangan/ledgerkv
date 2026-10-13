@@ -1,14 +1,72 @@
 # ledgerkv
 
-A crash-safe, persistent key-value store in C++20, built from scratch as a
-log-structured merge tree: a write-ahead log with group commit, a lock-free
-skiplist memtable, sorted on-disk tables with bloom filters, leveled
-compaction, snapshots, and iterators.
+[![ci](https://github.com/aahangan/ledgerkv/actions/workflows/ci.yml/badge.svg)](https://github.com/aahangan/ledgerkv/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-The goal is correctness you can check, not peak speed. Each durability claim
-here is backed by a test that tries to break it: process kills, simulated
-power loss with torn writes, injected I/O errors, and fuzzing. Each test has
-been shown to catch real bugs, by planting them on purpose.
+A crash-safe key-value storage engine in C++20, the kind that sits under
+databases like RocksDB and Cassandra: a log-structured merge tree with a
+write-ahead log, group commit, a lock-free skiplist memtable, SSTables with
+bloom filters, leveled compaction, snapshots, and iterators.
+
+**What makes it different is how it is tested.** A fault-injection
+filesystem simulates power loss and disk errors, and every recovery is
+checked against a model of what must have survived.
+
+## The fault-injection filesystem
+
+All file I/O goes through a pluggable `Env`. In tests, it is wrapped by
+[`FaultInjectionEnv`](src/fault_env.h), which keeps a ledger of what a real
+disk would actually have made durable:
+
+```
+   ledgerkv ──► FaultInjectionEnv ──────────────────────► real filesystem
+                │ per file:  bytes written vs. bytes fsynced
+                │            directory entry fsynced yet?
+                │ pending:   renames and deletes not yet made durable
+                │            by a directory fsync (deleted files are parked)
+                │ faults:    fail the Nth fsync / write / rename / read
+                ▼
+   power cut ─► rewind the disk to what could survive:
+                · unsynced tails dropped, or torn and followed by garbage
+                · files whose directory entry was never fsynced vanish
+                · unsynced renames and deletes are undone
+```
+
+The [power-loss harness](tools/powerloss_test.cc) cuts the power at random
+moments, mid-write, mid-flush, and mid-compaction, then reopens the database
+and requires the recovered state to be **exactly the result of some prefix of
+the writes**: no holes, no reordering, no torn batches, no wrong values. With
+`sync = true`, that prefix must include every acknowledged write.
+
+| `make powerloss` | Power cuts | Result |
+|---|---|---|
+| `sync = true` | 200 | every acknowledged write survived |
+| `sync = false` | 600 | every recovery an exact prefix of the writes (recent unsynced writes may be lost, by design) |
+| `sync = true` + one injected I/O error per cut | 300 | 160+ errors fire per run across 8 kinds (failed fsync, short write, failed rename, ...); no acknowledged write lost, and writes are refused after a WAL failure |
+
+It found two real bugs, both fixed: with `sync = false`, a power cut could
+recover a state with a *hole* in it; and fuzzing found an integer overflow
+that let a crafted table file trigger an out-of-bounds read. Details are in
+[Testing](#testing).
+
+## Claims and evidence
+
+Every figure is reproducible with one command. The reference run is in
+[bench/results/reference-apple-m5.md](bench/results/reference-apple-m5.md)
+(Apple M5, macOS, internal SSD).
+
+| Claim | Measured | Reproduce | Code |
+|---|---|---|---|
+| Group commit raises fsynced write throughput | 28× (309 → 8,717 writes/s at 64 writers) | `make bench-quick` | [`DBImpl::Write`](src/db.cc) |
+| Random writes at 10M keys | 116K/s inserting, 87K/s overwriting | `make bench` | [`src/db.cc`](src/db.cc) |
+| Write and space amplification at 10M keys | 9.8× write, 1.33× space | `make bench` | [leveled compaction](#leveled-compaction) |
+| Random-read latency at 1M keys | p99 16 µs (p50 8.2 µs) | `make bench-quick` | [read path](#read-path-snapshots-and-iterators) |
+| Bloom filters skip disk reads for absent keys | 99.2% of table checks need no read | `make bench-quick` | [`src/bloom.cc`](src/bloom.cc) |
+| Power loss never corrupts or reorders data | all 1,100 simulated power cuts recover an exact prefix of the writes | `make powerloss` | [`src/fault_env.cc`](src/fault_env.cc) |
+| No acknowledged write lost with `sync = true` | 0 lost across 500 power cuts, 300 of them with an injected I/O error (160+ errors per run) | `make powerloss` | [`tools/powerloss_test.cc`](tools/powerloss_test.cc) |
+| No lost writes or torn batches on process crash | `SIGKILL` mid-write, 1 and 8 writer threads | `make crash` | [`tools/crash_test.cc`](tools/crash_test.cc) |
+| Decoders and API survive fuzzing | 4 targets: libFuzzer in CI, ASan + UBSan locally | `make fuzz` | [`fuzz/`](fuzz) |
+| Sanitizer-clean on Linux and macOS | ASan, TSan, UBSan on every push | CI | [`ci.yml`](.github/workflows/ci.yml) |
 
 ## Status
 
@@ -61,23 +119,24 @@ db->GetStats();    // Per-level sizes, amplification inputs, group commit sizes
 
 ## Build and test
 
+Needs CMake 3.20+ and a C++20 compiler. No other dependencies.
+
 ```sh
-cmake -S . -B build && cmake --build build -j
-./build/ledgerkv_tests                               # unit tests
-./build/crash_test --iterations 200 --threads 8      # SIGKILL mid-write
-./build/powerloss_test --iterations 200 --sync       # simulated power cuts
-./build/powerloss_test --iterations 200 --sync --faults   # ...plus I/O errors
-./build/fuzz_db --iterations 50000                   # also fuzz_log, fuzz_write_batch, fuzz_table
-./build/kvbench --num 1000000                        # add --sync to fsync every write
+make                # build (CMake underneath; see the Makefile)
+make test           # 53 unit tests
+make crash          # SIGKILL mid-write, 1 and 8 writer threads
+make powerloss      # 1,100 simulated power cuts, 300 with injected I/O errors (~12 min)
+make fuzz           # 4 fuzz targets, 20,000 mutated inputs each
+make check          # all of the above
+make bench-quick    # performance figures at 1M keys, including group commit (~2 min)
+make bench          # plus 10M keys (~12 min); writes bench/results/latest.md
 ```
 
-For coverage-guided fuzzing, build with a clang that ships libFuzzer:
-`cmake -S . -B build-fuzz -DCMAKE_CXX_COMPILER=clang++ -DLEDGERKV_FUZZ=ON
--DLEDGERKV_SANITIZE=address`, then `./build/fuzz_seeds corpus` (from a normal
-build) and `./build-fuzz/fuzz_db corpus/db`.
-
 Sanitizer builds: `cmake -S . -B build-asan -DLEDGERKV_SANITIZE=address` (also
-`thread`, `undefined`).
+`thread`, `undefined`). For coverage-guided fuzzing, build with a clang that
+ships libFuzzer: `cmake -S . -B build-fuzz -DCMAKE_CXX_COMPILER=clang++
+-DLEDGERKV_FUZZ=ON -DLEDGERKV_SANITIZE=address`, write the seed corpus with
+`./build/fuzz_seeds corpus`, then run e.g. `./build-fuzz/fuzz_db corpus/db`.
 
 ## Design
 
@@ -454,11 +513,13 @@ failed directory fsync. The error must reach the caller. After a WAL failure,
 writes must still be refused even once the disk "recovers". And the prefix
 rule must still hold afterwards.
 
+Latest `make powerloss` run (11.5 minutes):
+
 | Mode | Power cuts | Operations | Result |
 |---|---|---|---|
-| `sync = true` | 200 | 1.49M | every acknowledged write survived |
-| `sync = false` | 600 (3 seeds) | 4.6M | every recovery an exact prefix; unsynced tail lost averaged 220–250 ops, max 566 |
-| `sync = true` + I/O errors | 300 | 1.47M | 170 injected errors (all 8 kinds), none lost an acknowledged write |
+| `sync = true` | 200 | 1.53M | every acknowledged write survived |
+| `sync = false` | 600 | 3.05M | every recovery an exact prefix; unsynced tail lost averaged 271 ops, max 561 (about one memtable) |
+| `sync = true` + I/O errors | 300 | 1.43M | 166 injected errors across all 8 kinds, none lost an acknowledged write; all 75 WAL failures made later writes fail |
 
 Unit tests pin down the specific cases: a WAL fsync failure is sticky and
 loses nothing acknowledged; a short WAL write does not strand later writes;
@@ -483,85 +544,64 @@ failures.
 
 ## Benchmarks
 
-Apple M5 (16 GB RAM), macOS 26.4, internal SSD, 16-byte keys, 100-byte
-values, 4 MB memtable, default level sizes. Latency is per operation. One
-client thread unless noted. `fillrandom` and `overwrite` each write N random
-keys, so about 86% of the key space ends up live. Write throughput varies by
-roughly ±25% from run to run with compaction timing.
+Full results, with every phase's throughput and p50/p99/p99.9 latency, are in
+[bench/results/reference-apple-m5.md](bench/results/reference-apple-m5.md),
+generated by `make bench` at commit `f4d9eb5` on an Apple M5 (16 GB RAM,
+macOS 26.4, internal SSD). Run `make bench` to get the same report for your
+machine. One client thread unless noted, 16-byte keys, 100-byte values, 4 MB
+memtable. Throughput varies by roughly ±25% between runs with compaction
+timing.
 
 **Group commit** (every write fsynced with `F_FULLFSYNC` before it is
 acknowledged):
 
 | Concurrent writers | Writes/s | Writes per fsync | p50 latency |
 |---|---|---|---|
-| 1 | 270 | 1.0 | 4.0 ms |
-| 4 | 656 | 2.4 | 6.1 ms |
-| 16 | 2,226 | 8.2 | 7.0 ms |
-| 64 | **8,589** | 32.0 | 7.2 ms |
+| 1 | 309 | 1.0 | 3.1 ms |
+| 4 | 680 | 2.4 | 6.1 ms |
+| 16 | 2,140 | 8.1 | 7.8 ms |
+| 64 | **8,717** | 32.2 | 7.3 ms |
 
-Throughput grows almost linearly with the number of writers (32× at 64) while
-each writer's latency stays near the cost of two fsyncs: the one already in
-flight when it arrives, and its own group's.
+Throughput grows almost linearly with the number of writers while each
+writer's latency stays near the cost of two fsyncs: the one already in flight
+when it arrives, and its own group's.
 
-**10M operations per phase** (957 MB live data):
+**Summary:**
 
-| Workload | ops/s | p50 | p99 | p99.9 |
-|---|---|---|---|---|
-| fillseq | 322K | 1.6 µs | 5.7 µs | 27 µs |
-| fillrandom | 117K | 1.8 µs | 7.6 µs | 1.3 ms |
-| overwrite | 84K | 1.9 µs | 9.4 µs | 1.5 ms |
-| readrandom | 87K | 8.6 µs | 99 µs | 217 µs |
-| readrandom, 8 threads | 629K | 10 µs | 52 µs | 181 µs |
-| readmissing (bloom filters) | 2.27M | 0.25 µs | 8.8 µs | 11 µs |
-| seek + 10 × next | 34K | 26 µs | 47 µs | 131 µs |
-| full scan | 3.09M entries/s (341 MB/s) | | | |
-
-| | |
-|---|---|
-| Shape after 20M writes | L0 3 tables, L1 21, L2 101, L3 499 |
-| Space amplification | 1.33× (1.27 GB on disk for 957 MB live) |
-| Write amplification | 9.8× table bytes per user byte, plus ~1× for the WAL |
-| Reopen | 77 ms |
-
-**1M operations per phase** (96 MB live data):
-
-| Workload | ops/s | p50 | p99 | p99.9 |
-|---|---|---|---|---|
-| fillrandom | 200K | 1.9 µs | 12 µs | 336 µs |
-| overwrite | 185K | 1.8 µs | 7.2 µs | 1.3 ms |
-| readrandom | 132K | 8.3 µs | 16 µs | 38 µs |
-| readrandom, 8 threads | 669K | 11 µs | 38 µs | 84 µs |
-| readmissing | 2.72M | 0.21 µs | 8.3 µs | 9.0 µs |
-| seek + 10 × next | 36K | 25 µs | 46 µs | 118 µs |
-| full scan | 3.46M entries/s (382 MB/s) | | | |
-
-Space amp 1.45×, write amp 4.2×, reopen 39 ms.
+| | 1M operations per phase | 10M operations per phase |
+|---|---|---|
+| Random inserts / overwrites | 245K/s / 186K/s | 116K/s / 87K/s |
+| Sequential inserts | 323K/s | 310K/s |
+| Random reads, 1 thread (p50 / p99) | 131K/s (8.2 µs / 16 µs) | 78K/s (8.8 µs / 112 µs) |
+| Random reads, 8 threads | 656K/s | 668K/s |
+| Absent-key reads | 2.70M/s | 2.21M/s |
+| Bloom filters: absent-key table checks needing no disk read | 99.2% | 99.2% |
+| Full scan | 3.08M entries/s | 3.48M entries/s |
+| Write / space amplification | 4.2× / 1.43× | 9.8× / 1.33× |
+| Reopen (recovery) | 52 ms | 80 ms |
 
 What these numbers say:
 - **Group commit is the big win for durable writes.** A single fsynced
-  writer is capped at one `F_FULLFSYNC` (~4 ms) per write. Concurrent writers
-  share fsyncs, so 64 of them get 32× the throughput.
-- **Reads scale across threads** (5–7× on 8 threads) because `Get` holds a
+  writer is capped at one `F_FULLFSYNC` (~3–4 ms) per write. Concurrent
+  writers share fsyncs, so 64 of them get 28× the throughput.
+- **Reads scale across threads** (5–9× on 8 threads) because `Get` holds a
   lock only long enough to copy three pointers, the memtable is lock-free,
-  and tables are read with `pread()`. The shared lock and reference counts
-  are what keep it short of 8×.
+  and tables are read with `pread()`. At 10M keys, single-threaded reads wait
+  on the SSD, so eight threads overlap those waits and scale further.
 - **Compaction trades write throughput for reads and space.** Before
   compaction (milestone 2), random writes ran at 445K/s, but 1M keys took
   2× their size on disk and a read could check 85 tables. Now a read checks
   at most a few level-0 tables plus one per level.
 - **Random writes are compaction-bound at 10M.** A single background thread
-  writes ~10× the user data, and writers spent 105 s stalled over the two
+  writes ~10× the user data, and writers spent 101 s stalled over the two
   10M-write phases, which is where the 1–2 ms p99.9 comes from. Running
   compactions on more threads, or limiting how much a compaction can overlap
   the level two below (as LevelDB does), would be the next steps.
-- **readrandom p99 at 10M is disk-bound.** ~10 GB of compaction writes churn
-  the page cache, so the tail includes SSD reads. There is no block cache yet.
+- **Read p99 at 10M is disk-bound.** ~10 GB of compaction writes churn the
+  page cache, so the tail includes SSD reads. There is no block cache yet.
 - **The hardening layer cost nothing measurable.** Routing all I/O through a
   virtual `Env`, and syncing the retiring log at each memtable switch, left
   every benchmark within normal run-to-run variance.
-- **Multi-version storage cost little.** Moving from a `std::map` that kept
-  one version per key to a skiplist that keeps every version left
-  single-threaded throughput about where it was in milestone 3.
 
 ## License
 

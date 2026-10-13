@@ -2,7 +2,7 @@
 #
 #   make             build
 #   make test        unit tests
-#   make powerloss   1,100 simulated power cuts, 300 of them with I/O errors
+#   make powerloss   1,100 simulated power cuts, 300 of them with I/O errors (~12 min)
 #   make check       everything CI runs (without sanitizers)
 #   make bench       reproduce the README's performance figures (~12 min)
 #   make bench-quick the 1M-key half of that (~2 min)
