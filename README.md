@@ -562,3 +562,7 @@ What these numbers say:
 - **Multi-version storage cost little.** Moving from a `std::map` that kept
   one version per key to a skiplist that keeps every version left
   single-threaded throughput about where it was in milestone 3.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
