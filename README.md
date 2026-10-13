@@ -19,17 +19,20 @@ All file I/O goes through a pluggable `Env`. In tests, it is wrapped by
 disk would actually have made durable:
 
 ```
-   ledgerkv ──► FaultInjectionEnv ──────────────────────► real filesystem
-                │ per file:  bytes written vs. bytes fsynced
-                │            directory entry fsynced yet?
-                │ pending:   renames and deletes not yet made durable
-                │            by a directory fsync (deleted files are parked)
-                │ faults:    fail the Nth fsync / write / rename / read
-                ▼
-   power cut ─► rewind the disk to what could survive:
-                · unsynced tails dropped, or torn and followed by garbage
-                · files whose directory entry was never fsynced vanish
-                · unsynced renames and deletes are undone
+ledgerkv ──► FaultInjectionEnv ──► real filesystem
+             │
+             ├ tracks per file: bytes written
+             │   vs. bytes fsynced, and whether
+             │   its directory entry is fsynced
+             ├ parks renames and deletes until
+             │   the directory is fsynced
+             └ injects faults: failed fsync,
+                 short write, failed rename, ...
+
+power cut ──► rewind to what a disk could keep:
+             · unsynced tails dropped, or torn
+             · never-fsynced directory entries gone
+             · unsynced renames and deletes undone
 ```
 
 The [power-loss harness](tools/powerloss_test.cc) cuts the power at random
