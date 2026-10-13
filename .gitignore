@@ -3,3 +3,5 @@ build*/
 compile_commands.json
 *.o
 .DS_Store
+bench/results/latest.md
+fuzz-crash.bin

@@ -22,9 +22,19 @@ class Snapshot {
   virtual ~Snapshot() = default;
 };
 
+// Per-read counters, filled in when ReadOptions::stats is set. Accumulates
+// across calls; the caller owns it and must not share it between threads.
+struct ReadStats {
+  uint64_t tables_checked = 0;  // Tables whose key range covered the key.
+  uint64_t bloom_skips = 0;     // Of those, ruled out by the bloom filter with no read.
+  uint64_t blocks_read = 0;     // Data blocks read from the file.
+};
+
 struct ReadOptions {
   // Read as of this snapshot instead of the latest state.
   const Snapshot* snapshot = nullptr;
+  // If set, Get() adds what it did to these counters.
+  ReadStats* stats = nullptr;
 };
 
 struct DBStats {

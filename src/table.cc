@@ -95,9 +95,17 @@ Status Table::Open(const std::string& path, uint64_t file_size, std::shared_ptr<
   return Status::OK();
 }
 
-Status Table::Get(std::string_view key, uint64_t snapshot, std::string* value, LookupResult* result) const {
+Status Table::Get(std::string_view key, uint64_t snapshot, std::string* value, LookupResult* result,
+                  ReadStats* stats) const {
   *result = LookupResult::kMissing;
-  if (!BloomMayContain(filter_, key)) return Status::OK();
+  if (stats) stats->tables_checked++;
+  if (!BloomMayContain(filter_, key)) {
+    if (stats) stats->bloom_skips++;
+    return Status::OK();
+  }
+  // The seek below reads exactly one block: the index points at the block
+  // holding the first entry at or after the target.
+  if (stats) stats->blocks_read++;
 
   // The first entry at or after (key, snapshot) is the newest version of key
   // visible at snapshot, if any version is.

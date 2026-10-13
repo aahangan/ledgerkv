@@ -995,7 +995,7 @@ Status DBImpl::Get(const ReadOptions& options, std::string_view key, std::string
     if (level == 0) {
       for (const FileEntry& f : files) {
         if (!Overlaps(f.meta, key, key)) continue;
-        Status s = f.table->Get(key, seq, value, &r);
+        Status s = f.table->Get(key, seq, value, &r, options.stats);
         if (!s.ok()) return s;
         if (r != LookupResult::kMissing) break;
       }
@@ -1005,7 +1005,7 @@ Status DBImpl::Get(const ReadOptions& options, std::string_view key, std::string
         return std::string_view(f.meta.largest) < k;
       });
       if (it != files.end() && std::string_view(it->meta.smallest) <= key) {
-        Status s = it->table->Get(key, seq, value, &r);
+        Status s = it->table->Get(key, seq, value, &r, options.stats);
         if (!s.ok()) return s;
       }
     }

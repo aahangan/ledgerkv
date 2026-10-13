@@ -9,6 +9,7 @@
 
 #include "dbformat.h"
 #include "internal_iterator.h"
+#include "ledgerkv/db.h"
 #include "ledgerkv/env.h"
 #include "ledgerkv/status.h"
 
@@ -27,8 +28,10 @@ class Table {
   Table(const Table&) = delete;
   Table& operator=(const Table&) = delete;
 
-  // Looks up the newest version of key with sequence <= snapshot.
-  Status Get(std::string_view key, uint64_t snapshot, std::string* value, LookupResult* result) const;
+  // Looks up the newest version of key with sequence <= snapshot. If stats
+  // is set, counts the check, a bloom filter skip, or the block read.
+  Status Get(std::string_view key, uint64_t snapshot, std::string* value, LookupResult* result,
+             ReadStats* stats = nullptr) const;
 
   // Scans the table in internal order, holding one block in memory. The
   // table must outlive the iterator.
