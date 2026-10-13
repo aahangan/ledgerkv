@@ -341,7 +341,7 @@ The `Env` contract is the durability model the engine is written against:
 
 ## Testing
 
-51 unit tests, a process-crash harness, a power-loss harness, and four fuzz
+53 unit tests, a process-crash harness, a power-loss harness, and four fuzz
 targets. CI runs everything on Linux and macOS under AddressSanitizer,
 ThreadSanitizer, and UBSan, plus coverage-guided libFuzzer on Linux.
 
@@ -404,8 +404,16 @@ To check that the tests can catch real bugs, I injected these:
 | Skip the directory fsync after writing a table, before the MANIFEST names it | power-loss test | After the power cut the MANIFEST named a table that no longer existed |
 | A failed WAL append is not sticky, so later writes go ahead | power-loss test (faults), unit tests | Writes accepted after a WAL failure |
 | No sync of the retiring log at memtable switch (the original code, not a planted bug) | power-loss test, `sync = false` | Recovered state had a hole: not a prefix of the writes |
+| Table footer check `offset + size + trailer == file size` can overflow (the original code, not a planted bug) | libFuzzer in CI, then a crafted-file test | Out-of-bounds read from a 100-byte crafted table, confirmed with ASan |
 | Remove the bounds check from the length-prefixed field decoder | `fuzz_log`, `fuzz_write_batch`, `fuzz_table` | Heap buffer overflow, caught by ASan within seconds |
 | Compaction drops a version that is one sequence number too new for the oldest snapshot | `fuzz_db` | A snapshot read returned NotFound for a key it should see (94-byte input) |
+
+Two of those rows are bugs in the shipped code, not planted ones. The
+`sync = false` hole is described under Durability guarantees. The table
+reader trusted block offsets and sizes read from the file, and its footer
+check could be fooled by sums that wrap past 2^64. Now every block read is
+bounds-checked against the file size before anything is allocated, and the
+footer checks use subtraction.
 
 Two more findings came from checking the checks themselves. At first the
 power-loss harness confirmed "writes are refused after a WAL failure" while
